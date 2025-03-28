@@ -1,9 +1,14 @@
 import argparse
 import json
 import logging
+import tempfile
+import uuid
 from typing import Dict, List, Optional, Tuple
 
-from azure.ai.ml import MLClient
+from azure.ai.ml import (
+    Input,
+    MLClient,
+)
 from azure.ai.ml.dsl import pipeline
 from azure.ai.ml.entities import (  # Import CommandJob
     CommandJob,

@@ -1,33 +1,47 @@
 import argparse
 import json
 import mlflow
-import os
-
-# Import the specific client needed
-from mlflow.tracking import MlflowClient
 
 
-def log_metrics(job_id: str, metrics_json: str):
+def log_metrics(job_id: str, metrics_filepath: str):  # Accept file path
     print(f"Replaying metrics for job: {job_id}")
+    print(f"Reading metrics from file: {metrics_filepath}")
 
+    metrics = {}
     try:
-        metrics = json.loads(metrics_json)
+        # --- READ FROM FILE ---
+        with open(metrics_filepath, "r") as f:
+            metrics = json.load(f)  # Use json.load for file streams
+        print(
+            f"Successfully parsed metrics JSON from file. Found {len(metrics)} metrics."
+        )
     except json.JSONDecodeError as e:
-        print(f"Failed to parse metrics JSON: {e}")
-        print(f"Received JSON string: {metrics_json}")  # Log the problematic string
+        print(f"Failed to parse metrics JSON from file '{metrics_filepath}': {e}")
+        # Attempt to read content for debugging, handle potential read errors
+        try:
+            with open(metrics_filepath, "r") as f_err:
+                content = f_err.read()
+            print(
+                f"File content received: {content[:500]}{'...' if len(content) > 500 else ''}"
+            )
+        except Exception as read_err:
+            print(f"Could not read file content for debugging: {read_err}")
         return  # Exit if JSON is invalid
+    except FileNotFoundError:
+        print(f"ERROR: Metrics file not found at path: {metrics_filepath}")
+        return
+    except Exception as file_err:  # Catch other potential file errors
+        print(f"ERROR: Could not read metrics file '{metrics_filepath}': {file_err}")
+        return
 
-    # --- Use explicit client and existing run ---
-    # Azure ML jobs automatically start a run context.
-    # We should log to the *current* run context provided by the job environment.
-    # Do NOT call mlflow.start_run() as it creates a *nested* run which is usually not intended here.
-
+    # --- Logging logic (no change needed, uses fluent API) ---
     print("Attempting to log metrics to the current Azure ML job run.")
     try:
-        # Log metrics directly using the fluent API, which uses the current active run
+        if not metrics:
+            print("No metrics found in the parsed data to log.")
+
         for key, value in metrics.items():
             try:
-                # Ensure value is floatable
                 metric_value = float(value)
                 mlflow.log_metric(key, metric_value)
                 print(f"Logged metric: {key} = {metric_value}")
@@ -36,27 +50,20 @@ def log_metrics(job_id: str, metrics_json: str):
                     f"Failed to convert or log metric '{key}' with value '{value}': {e}"
                 )
 
-        # Log the tag to the current run
         mlflow.set_tag("replayed_from_job", job_id)
         print(f"Set tag 'replayed_from_job' = {job_id}")
 
     except Exception as e:
         print(f"An error occurred during MLflow logging: {e}")
-        # Potentially raise the error or exit differently if logging failure is critical
-        # raise
+        # raise # Optional: re-raise if logging failure is critical
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--job-id", type=str, required=True)
-    parser.add_argument("--metrics-json", type=str, required=True)
+    # --- UPDATE ARGUMENT NAME ---
+    parser.add_argument("--metrics-file", type=str, required=True)  # Expect file path
     args = parser.parse_args()
 
-    # --- Verify environment variables (optional debugging) ---
-    # print("--- MLflow Environment Variables ---")
-    # for var in ["MLFLOW_TRACKING_URI", "MLFLOW_RUN_ID", "MLFLOW_EXPERIMENT_ID", "MLFLOW_ARTIFACT_URI"]:
-    #     print(f"{var}={os.environ.get(var)}")
-    # print("---------------------------------")
-
-    log_metrics(args.job_id, args.metrics_json)
+    log_metrics(args.job_id, args.metrics_file)  # Pass file path
     print("Metrics logging script finished.")

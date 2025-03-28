@@ -1,4 +1,5 @@
-from azure.ai.ml import command
+from azure.ai.ml import command, Input
+from azure.ai.ml.constants import AssetTypes
 from azure.ai.ml.entities import Environment
 
 # Define a minimal environment (can be shared across all dummy steps)
@@ -24,9 +25,9 @@ replay_metrics_component = command(
     description="Logs historical metrics into this dummy step",
     inputs={
         "original_job_id": "string",
-        "metrics_json": "string",
+        "metrics_file": Input(type=AssetTypes.URI_FILE),
     },
     code="./replayer/component_code",
-    command="python log_metrics.py --job-id ${{inputs.original_job_id}} --metrics-json ${{inputs.metrics_json}}",
-    environment=REGISTERED_ENV_ID,  # Use name:version string
+    command='python log_metrics.py --job-id "${{inputs.original_job_id}}" --metrics-file ${{inputs.metrics_file}}',
+    environment=REGISTERED_ENV_ID,
 )
