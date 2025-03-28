@@ -1,0 +1,281 @@
+[
+{
+  "name": "labeling_Inference_7b9f679c_1698238717415",
+  "job_type": "command",
+  "experiment_name": "labeling_Inference_7b9f679c",
+  "parent_job_name": null,
+  "status": "Completed",
+  "created_time": "2023-10-25T12:58:38.042835+00:00",
+  "metrics": {},
+  "tags": {
+    "_aml_system_ComputeTargetStatus": "{\"AllocationState\":\"steady\",\"PreparingNodeCount\":0,\"RunningNodeCount\":0,\"CurrentNodeCount\":0}",
+    "mlflow.source.type": "JOB",
+    "mlflow.source.name": "score_script.py"
+  }
+},
+{
+  "name": "607d6225-20a0-4f26-a160-b6fd6bbe6ee0",
+  "job_type": "pipeline",
+  "experiment_name": "Anonymize-Bike-Videos",
+  "parent_job_name": null,
+  "status": "Completed",
+  "created_time": "2023-05-05T17:20:46.177873+00:00",
+  "metrics": {},
+  "tags": {}
+},
+{
+  "name": "a18ffa7e-2c0e-4cf3-9817-80c6ccb1b6c3",
+  "job_type": "pipeline",
+  "experiment_name": "Anonymize-Bike-Videos",
+  "parent_job_name": null,
+  "status": "Completed",
+  "created_time": "2023-05-05T14:19:11.613718+00:00",
+  "metrics": {},
+  "tags": {}
+},
+{
+  "name": "79f4c773-b1a2-46e4-9813-009a0da851e3",
+  "job_type": "pipeline",
+  "experiment_name": "Anonymize-Bike-Videos",
+  "parent_job_name": null,
+  "status": "Completed",
+  "created_time": "2023-05-05T06:39:17.281960+00:00",
+  "metrics": {},
+  "tags": {}
+},
+{
+  "name": "olden_flower_hjrjmdnkqf",
+  "job_type": "pipeline",
+  "experiment_name": "GoPro-Video",
+  "parent_job_name": null,
+  "status": "Failed",
+  "created_time": "2023-05-04T12:03:14.542480+00:00",
+  "metrics": {},
+  "tags": {}
+},
+{
+  "name": "frosty_apple_rt1j8nrt4d",
+  "job_type": "pipeline",
+  "experiment_name": "Anonymize-Bike-Videos",
+  "parent_job_name": null,
+  "status": "Failed",
+  "created_time": "2023-05-04T10:35:01.818012+00:00",
+  "metrics": {},
+  "tags": {}
+},
+{
+  "name": "willing_sprout_y666dqr1sf",
+  "job_type": "pipeline",
+  "experiment_name": "GoPro-Video",
+  "parent_job_name": null,
+  "status": "Completed",
+  "created_time": "2023-03-21T14:08:09.170585+00:00",
+  "metrics": {},
+  "tags": {}
+},
+{
+  "name": "35e78e7c-2146-49db-8fa4-1e60ef2a71fa",
+  "job_type": "pipeline",
+  "experiment_name": "Anonymize-Bike-Videos",
+  "parent_job_name": null,
+  "status": "Completed",
+  "created_time": "2023-03-06T09:37:37.802112+00:00",
+  "metrics": {},
+  "tags": {
+    "azureml.Designer": "true"
+  }
+},
+{
+  "name": "bubbly_rose_xthlrkh053",
+  "job_type": "pipeline",
+  "experiment_name": "GoPro-Video",
+  "parent_job_name": null,
+  "status": "Completed",
+  "created_time": "2023-02-22T14:43:14.533919+00:00",
+  "metrics": {},
+  "tags": {}
+},
+{
+  "name": "bubbly_jelly_sj8n1p5k4f",
+  "job_type": "pipeline",
+  "experiment_name": "Anonymize-Bike-Videos",
+  "parent_job_name": null,
+  "status": "Completed",
+  "created_time": "2023-01-09T17:00:42.764332+00:00",
+  "metrics": {},
+  "tags": {}
+},
+{
+  "name": "honest_knot_7l1xhym92y",
+  "job_type": "command",
+  "experiment_name": "Anonymize-Bike-Videos",
+  "parent_job_name": null,
+  "status": "Completed",
+  "created_time": "2022-11-10T19:23:22.850316+00:00",
+  "metrics": {},
+  "tags": {
+    "_aml_system_ComputeTargetStatus": "{\"AllocationState\":\"steady\",\"PreparingNodeCount\":0,\"RunningNodeCount\":0,\"CurrentNodeCount\":1}"
+  }
+},
+{
+  "name": "coral_okra_pm5f3gtpz9",
+  "job_type": "pipeline",
+  "experiment_name": "Anonymize-Bike-Videos",
+  "parent_job_name": null,
+  "status": "Completed",
+  "created_time": "2022-11-03T13:36:46.073907+00:00",
+  "metrics": {},
+  "tags": {}
+},
+{
+  "name": "quiet_tangelo_185t92dxq5",
+  "job_type": "pipeline",
+  "experiment_name": "Anonymize-Bike-Videos",
+  "parent_job_name": null,
+  "status": "Completed",
+  "created_time": "2022-11-03T12:30:27.497260+00:00",
+  "metrics": {},
+  "tags": {}
+},
+{
+  "name": "bold_scooter_59zdcsc0nt",
+  "job_type": "pipeline",
+  "experiment_name": "Anonymize-Bike-Videos",
+  "parent_job_name": null,
+  "status": "Completed",
+  "created_time": "2022-11-02T19:56:54.863997+00:00",
+  "metrics": {},
+  "tags": {}
+},
+{
+  "name": "labeling_Inference_7b9f679c_1667417742041",
+  "job_type": "command",
+  "experiment_name": "labeling_Inference_7b9f679c",
+  "parent_job_name": null,
+  "status": "Completed",
+  "created_time": "2022-11-02T19:35:42.339241+00:00",
+  "metrics": {},
+  "tags": {
+    "_aml_system_ComputeTargetStatus": "{\"AllocationState\":\"resizing\",\"PreparingNodeCount\":0,\"RunningNodeCount\":0,\"CurrentNodeCount\":1}",
+    "mlflow.source.type": "JOB",
+    "mlflow.source.name": "score_script.py"
+  }
+},
+{
+  "name": "labeling_Inference_7b9f679c_1667416855494",
+  "job_type": "command",
+  "experiment_name": "labeling_Inference_7b9f679c",
+  "parent_job_name": null,
+  "status": "Completed",
+  "created_time": "2022-11-02T19:20:55.841887+00:00",
+  "metrics": {},
+  "tags": {
+    "_aml_system_ComputeTargetStatus": "{\"AllocationState\":\"steady\",\"PreparingNodeCount\":0,\"RunningNodeCount\":0,\"CurrentNodeCount\":0}",
+    "mlflow.source.type": "JOB",
+    "mlflow.source.name": "score_script.py"
+  }
+},
+{
+  "name": "AutoML_37c955ca-b887-4f18-b501-b9ad47082c15",
+  "job_type": "automl",
+  "experiment_name": "labeling_Training_7b9f679c",
+  "parent_job_name": null,
+  "status": "Completed",
+  "created_time": "2022-11-02T18:04:34.742465+00:00",
+  "metrics": {},
+  "tags": {
+    "model_explain_run": "best_run",
+    "_aml_system_automl_run_workspace_id": "4db11024-74c3-4ddc-abfd-70acb53d4594",
+    "_aml_system_azureml.automlComponent": "AutoML",
+    "_azureml.ComputeTargetType": "STANDARD_NC6",
+    "pipeline_id": "",
+    "score": "",
+    "predicted_cost": "",
+    "fit_time": "",
+    "training_percent": "",
+    "iteration": "",
+    "run_preprocessor": "",
+    "run_algorithm": "",
+    "automl_best_child_run_id": "AutoML_37c955ca-b887-4f18-b501-b9ad47082c15_HD_0"
+  }
+},
+{
+  "name": "labeling_Inference_7b9f679c_1667412101995",
+  "job_type": "command",
+  "experiment_name": "labeling_Inference_7b9f679c",
+  "parent_job_name": null,
+  "status": "Completed",
+  "created_time": "2022-11-02T18:01:42.217925+00:00",
+  "metrics": {},
+  "tags": {
+    "_aml_system_ComputeTargetStatus": "{\"AllocationState\":\"steady\",\"PreparingNodeCount\":0,\"RunningNodeCount\":0,\"CurrentNodeCount\":2}",
+    "mlflow.source.type": "JOB",
+    "mlflow.source.name": "score_script.py"
+  }
+},
+{
+  "name": "willing_melon_1rglmsbywm",
+  "job_type": "pipeline",
+  "experiment_name": "Anonymize-Bike-Videos",
+  "parent_job_name": null,
+  "status": "Completed",
+  "created_time": "2022-11-02T16:55:18.339057+00:00",
+  "metrics": {},
+  "tags": {}
+},
+{
+  "name": "labeling_Inference_7b9f679c_1667402116137",
+  "job_type": "command",
+  "experiment_name": "labeling_Inference_7b9f679c",
+  "parent_job_name": null,
+  "status": "Completed",
+  "created_time": "2022-11-02T15:15:16.322970+00:00",
+  "metrics": {},
+  "tags": {
+    "_aml_system_ComputeTargetStatus": "{\"AllocationState\":\"steady\",\"PreparingNodeCount\":0,\"RunningNodeCount\":0,\"CurrentNodeCount\":1}",
+    "mlflow.source.type": "JOB",
+    "mlflow.source.name": "score_script.py"
+  }
+},
+{
+  "name": "labeling_Inference_7b9f679c_1667402015937",
+  "job_type": "command",
+  "experiment_name": "labeling_Inference_7b9f679c",
+  "parent_job_name": null,
+  "status": "Completed",
+  "created_time": "2022-11-02T15:13:36.131058+00:00",
+  "metrics": {},
+  "tags": {
+    "_aml_system_ComputeTargetStatus": "{\"AllocationState\":\"steady\",\"PreparingNodeCount\":0,\"RunningNodeCount\":1,\"CurrentNodeCount\":1}",
+    "mlflow.source.type": "JOB",
+    "mlflow.source.name": "score_script.py"
+  }
+},
+{
+  "name": "labeling_Inference_7b9f679c_1667401915171",
+  "job_type": "command",
+  "experiment_name": "labeling_Inference_7b9f679c",
+  "parent_job_name": null,
+  "status": "Completed",
+  "created_time": "2022-11-02T15:11:55.390171+00:00",
+  "metrics": {},
+  "tags": {
+    "_aml_system_ComputeTargetStatus": "{\"AllocationState\":\"steady\",\"PreparingNodeCount\":0,\"RunningNodeCount\":0,\"CurrentNodeCount\":1}",
+    "mlflow.source.type": "JOB",
+    "mlflow.source.name": "score_script.py"
+  }
+},
+{
+  "name": "labeling_Inference_7b9f679c_1667401817629",
+  "job_type": "command",
+  "experiment_name": "labeling_Inference_7b9f679c",
+  "parent_job_name": null,
+  "status": "Completed",
+  "created_time": "2022-11-02T15:10:17.867011+00:00",
+  "metrics": {},
+  "tags": {
+    "_aml_system_ComputeTargetStatus": "{\"AllocationState\":\"steady\",\"PreparingNodeCount\":0,\"RunningNodeCount\":0,\"CurrentNodeCount\":1}",
+    "mlflow.source.type": "JOB",
+    "mlflow.source.name": "score_script.py"
+  }
+}
