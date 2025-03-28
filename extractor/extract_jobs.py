@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import os
+import sys  # Import sys for stdout/stderr handlers
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, List, Optional
@@ -18,15 +19,63 @@ from mlflow.exceptions import MlflowException
 from mlflow.tracking import MlflowClient
 from tqdm import tqdm
 
+# Assuming utils.aml_clients is in the path or installed
 from utils.aml_clients import get_ml_client
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
+# --- Logging Setup ---
 
-# --- Helper Functions ---
+# Remove basicConfig, we will configure handlers manually
+# logging.basicConfig(...)
+
+# Get our specific logger
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)  # Capture INFO level messages for the file
+logger.propagate = False  # Prevent propagation to root logger
+
+# Also configure the azure SDK loggers if desired
+azure_logger = logging.getLogger("azure")
+azure_logger.setLevel(logging.INFO)  # Capture SDK INFO messages for the file
+azure_logger.propagate = False
+
+
+def setup_logging():
+    """Configures file and console logging handlers."""
+    # Create logs directory
+    log_dir = "logs"
+    os.makedirs(log_dir, exist_ok=True)
+
+    # Create timestamped log file name
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_filename = os.path.join(log_dir, f"extract_jobs_{timestamp}.log")
+
+    # --- File Handler (INFO and above) ---
+    file_handler = logging.FileHandler(log_filename, encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_formatter = logging.Formatter(
+        "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+    )
+    file_handler.setFormatter(file_formatter)
+
+    # --- Console Handler (WARNING and above) ---
+    # Use sys.stderr because tqdm typically writes to stderr
+    console_handler = logging.StreamHandler(sys.stderr)
+    console_handler.setLevel(logging.WARNING)
+    console_formatter = logging.Formatter("%(levelname)s: %(name)s: %(message)s")
+    console_handler.setFormatter(console_formatter)
+
+    # --- Add Handlers ---
+    # Add handlers to our specific logger
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+    # Add handlers to the azure SDK logger
+    azure_logger.addHandler(file_handler)
+    azure_logger.addHandler(console_handler)
+
+    print(f"Detailed logs will be written to: {log_filename}")  # Info to stdout
+
+
+# --- Helper Functions (Keep as before) ---
 
 
 def safe_isoformat(dt_obj: Any) -> Optional[str]:
@@ -40,7 +89,12 @@ def safe_isoformat(dt_obj: Any) -> Optional[str]:
             else:  # Assume seconds
                 dt_obj = datetime.fromtimestamp(dt_obj, tz=timezone.utc)
         elif isinstance(dt_obj, str):
-            dt_obj = date_parser.parse(dt_obj)
+            # Handle potential timezone info like 'Z' or +00:00
+            dt_obj = (
+                date_parser.isoparse(dt_obj)
+                if ("Z" in dt_obj or "+" in dt_obj)
+                else date_parser.parse(dt_obj)
+            )
 
         if isinstance(dt_obj, datetime):
             if dt_obj.tzinfo is None:
@@ -53,7 +107,7 @@ def safe_isoformat(dt_obj: Any) -> Optional[str]:
                 f"Cannot convert non-datetime object to ISO format: {dt_obj} (Type: {type(dt_obj)})"
             )
             return str(dt_obj)  # Fallback to string representation
-    except (ValueError, TypeError, OverflowError) as e:
+    except (ValueError, TypeError, OverflowError, date_parser.ParserError) as e:
         logger.warning(f"Failed to convert timestamp {dt_obj} to ISO format: {e}")
         return str(dt_obj)  # Fallback
 
@@ -66,32 +120,34 @@ def safe_duration(start: Any, end: Any) -> Optional[float]:
         start_dt = None
         end_dt = None
 
-        # Convert start time
-        if isinstance(start, (int, float)):
-            start_dt = datetime.fromtimestamp(
-                start / 1000 if start > 1e12 else start, tz=timezone.utc
-            )
-        elif isinstance(start, str):
-            start_dt = date_parser.parse(start)
-        elif isinstance(start, datetime):
-            start_dt = start
+        # Function to parse time input
+        def parse_time(time_input):
+            if isinstance(time_input, (int, float)):
+                dt = datetime.fromtimestamp(
+                    time_input / 1000 if time_input > 1e12 else time_input,
+                    tz=timezone.utc,
+                )
+            elif isinstance(time_input, str):
+                # Use isoparse for better ISO 8601 handling, fallback to parse
+                try:
+                    dt = date_parser.isoparse(time_input)
+                except ValueError:
+                    dt = date_parser.parse(time_input)
 
-        # Convert end time
-        if isinstance(end, (int, float)):
-            end_dt = datetime.fromtimestamp(
-                end / 1000 if end > 1e12 else end, tz=timezone.utc
-            )
-        elif isinstance(end, str):
-            end_dt = date_parser.parse(end)
-        elif isinstance(end, datetime):
-            end_dt = end
+            elif isinstance(time_input, datetime):
+                dt = time_input
+            else:
+                return None
+
+            # Ensure timezone awareness for comparison
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)  # Convert aware datetimes to UTC
+
+        start_dt = parse_time(start)
+        end_dt = parse_time(end)
 
         if start_dt and end_dt:
-            # Ensure timezone awareness for comparison
-            if start_dt.tzinfo is None:
-                start_dt = start_dt.replace(tzinfo=timezone.utc)
-            if end_dt.tzinfo is None:
-                end_dt = end_dt.replace(tzinfo=timezone.utc)
             # Ensure end time is after start time
             if end_dt >= start_dt:
                 return (end_dt - start_dt).total_seconds()
@@ -102,11 +158,11 @@ def safe_duration(start: Any, end: Any) -> Optional[float]:
                 return None
         else:
             logger.warning(
-                f"Could not parse start ({start}) or end ({end}) time for duration calculation."
+                f"Could not parse start ({start}, type: {type(start)}) or end ({end}, type: {type(end)}) time for duration calculation."
             )
             return None
 
-    except (ValueError, TypeError, OverflowError) as e:
+    except (ValueError, TypeError, OverflowError, date_parser.ParserError) as e:
         logger.warning(f"Failed to calculate duration between {start} and {end}: {e}")
         return None
 
@@ -114,15 +170,21 @@ def safe_duration(start: Any, end: Any) -> Optional[float]:
 def convert_complex_dict(obj: Any) -> Any:
     """Recursively convert complex objects (like SDK entities) within dicts/lists to basic types."""
     if isinstance(obj, dict):
-        return {k: convert_complex_dict(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
+        # Handle potential non-string keys if they are basic types
+        return {
+            (
+                str(k) if not isinstance(k, (str, int, float, bool, type(None))) else k
+            ): convert_complex_dict(v)
+            for k, v in obj.items()
+        }
+    elif isinstance(obj, list) or isinstance(obj, tuple):  # Include tuples
         return [convert_complex_dict(item) for item in obj]
     elif hasattr(obj, "_to_dict"):  # Handle Azure SDK entities with _to_dict method
         try:
             return convert_complex_dict(obj._to_dict())
         except Exception as e:
             logger.debug(
-                f"Could not convert object with _to_dict using method: {e}. Falling back."
+                f"Could not convert object '{type(obj).__name__}' with _to_dict: {e}. Falling back."
             )
             pass  # Fall through to other methods
     elif hasattr(obj, "asdict"):  # Handle dataclasses
@@ -130,7 +192,7 @@ def convert_complex_dict(obj: Any) -> Any:
             return convert_complex_dict(asdict(obj))
         except Exception as e:
             logger.debug(
-                f"Could not convert object with asdict using method: {e}. Falling back."
+                f"Could not convert object '{type(obj).__name__}' with asdict: {e}. Falling back."
             )
             pass  # Fall through to other methods
     elif hasattr(obj, "__dict__"):  # Generic objects
@@ -141,15 +203,41 @@ def convert_complex_dict(obj: Any) -> Any:
                 for k, v in vars(obj).items()
                 if not k.startswith("_") and not callable(v)
             }
-            return convert_complex_dict(public_attrs)
+            if not public_attrs and hasattr(obj, "__slots__"):  # Handle slotted classes
+                public_attrs = {
+                    slot: getattr(obj, slot, None)
+                    for slot in obj.__slots__
+                    if not slot.startswith("_")
+                }
+            return (
+                convert_complex_dict(public_attrs) if public_attrs else str(obj)
+            )  # Fallback if no public attrs
         except Exception as e:
-            logger.debug(f"Could not convert object using __dict__: {e}. Falling back.")
+            logger.debug(
+                f"Could not convert object '{type(obj).__name__}' using __dict__/__slots__: {e}. Falling back."
+            )
             pass
+    # Handle basic types directly
     elif isinstance(obj, (str, int, float, bool, type(None))):
         return obj
+    # Handle specific types that need string conversion
+    elif isinstance(obj, (datetime, bytes)):
+        return (
+            safe_isoformat(obj)
+            if isinstance(obj, datetime)
+            else obj.decode("utf-8", errors="replace")
+        )
+    # Fallback for other types (timedelta, non-serializable objects)
     else:
-        # Fallback for other types (timedelta, etc.)
-        return str(obj)
+        try:
+            # Attempt a generic string conversion as last resort
+            s = str(obj)
+            # Avoid overly long or complex string representations in JSON
+            if len(s) > 200:
+                s = s[:197] + "..."
+            return s
+        except Exception:
+            return f"<Unserializable object: {type(obj).__name__}>"
 
 
 # --- Dataclass Definition ---
@@ -268,41 +356,54 @@ class JobMetadata:
         d = {}
         for f in fields(self):
             value = getattr(self, f.name)
+            # Ensure keys are strings for JSON compatibility
+            if isinstance(value, dict):
+                value = {str(k): v for k, v in value.items()}
             d[f.name] = convert_complex_dict(value)
         return d
 
 
-# --- Extraction Logic ---
+# --- Extraction Logic (Keep as before, logging goes to handlers) ---
 
 
 def extract_all_jobs(client: MLClient) -> Iterator[JobMetadata]:
     """Extract all jobs from the AzureML workspace and yield them one by one."""
+    # Logger is already configured by setup_logging()
+
     mlflow_tracking_uri = client.workspaces.get(
         client.workspace_name
     ).mlflow_tracking_uri
 
+    # Use logger.info - this will go to the file
     logger.info(f"Using MLflow tracking URI: {mlflow_tracking_uri}")
     mlflow.set_tracking_uri(mlflow_tracking_uri)
     mlflow_client = MlflowClient()
 
-    all_job_summaries = list(client.jobs.list())  # Get all summaries first for tqdm
-    logger.info(f"Found {len(all_job_summaries)} total job summaries.")
+    all_job_summaries = []
+    try:
+        # This might still log INFO messages from the SDK to the file
+        all_job_summaries = list(client.jobs.list())
+    except Exception as e:
+        logger.error(f"Failed to list job summaries: {e}")
+        return  # Stop if listing fails
 
-    for job_summary in tqdm(all_job_summaries, desc="Processing Jobs"):
+    # Use print for user-facing info to stdout
+    print(f"Found {len(all_job_summaries)} total job summaries. Starting extraction...")
+
+    # tqdm writes to stderr by default, which is fine
+    for job_summary in tqdm(all_job_summaries, desc="Processing Jobs", unit="job"):
         job_name = job_summary.name
-        # logger.info(f"Processing job: {job_name}") # Reduce verbosity with tqdm
+        # Reduce verbosity in loop, details go to file via logger
+        # logger.info(f"Processing job: {job_name}")
 
         try:
-            # Use the specific job name (which is often the run_id) to get the job
             job: Job = client.jobs.get(name=job_name)
-            # logger.debug(f"Successfully retrieved Job object for {job_name}")
         except ResourceNotFoundError:
             logger.warning(f"Job {job_name} not found via client.jobs.get(). Skipping.")
             continue
         except Exception as e:
-            logger.error(
-                f"Failed to retrieve job {job_name} via client.jobs.get(): {e}"
-            )
+            # logger.error will go to console and file
+            logger.error(f"Failed to retrieve full job details for {job_name}: {e}")
             continue
 
         # --- MLflow Data Extraction ---
@@ -321,16 +422,19 @@ def extract_all_jobs(client: MLClient) -> Iterator[JobMetadata]:
         script_name = None
 
         try:
-            # Use job_name which often corresponds to run_id
             mlflow_run = mlflow_client.get_run(job_name)
             if mlflow_run:
-                # logger.debug(f"Found MLflow run for job {job_name}")
+                logger.debug(
+                    f"Found MLflow run for job {job_name}"
+                )  # DEBUG won't show on console
                 if mlflow_run.data:
                     mlflow_metrics = mlflow_run.data.metrics or {}
                     mlflow_params = mlflow_run.data.params or {}
                     mlflow_tags_dict = mlflow_run.data.tags or {}
                     script_name = mlflow_tags_dict.get("mlflow.source.name")
-                    # logger.info(f"Retrieved {len(mlflow_metrics)} metrics for job {job_name}")
+                    logger.info(
+                        f"Retrieved {len(mlflow_metrics)} metrics, {len(mlflow_params)} params for MLflow run {job_name}"
+                    )  # Goes to file
                 if mlflow_run.info:
                     mlflow_run_id = mlflow_run.info.run_id
                     mlflow_run_name = mlflow_run.info.run_name
@@ -342,26 +446,29 @@ def extract_all_jobs(client: MLClient) -> Iterator[JobMetadata]:
                 if hasattr(mlflow_run, "inputs") and hasattr(
                     mlflow_run.inputs, "dataset_inputs"
                 ):
-                    mlflow_dataset_inputs = mlflow_run.inputs.dataset_inputs
+                    # Convert dataset inputs safely for JSON
+                    mlflow_dataset_inputs = convert_complex_dict(
+                        mlflow_run.inputs.dataset_inputs
+                    )
 
         except MlflowException as e:
-            # This is common if the job wasn't logged to MLflow (e.g., some system jobs)
-            if (
-                "RESOURCE_DOES_NOT_EXIST" in str(e)
-                or "Run with id=" in str(e)
-                and "not found" in str(e)
+            if "RESOURCE_DOES_NOT_EXIST" in str(e) or (
+                "Run with id=" in str(e) and "not found" in str(e)
             ):
-                logger.debug(
+                logger.info(
                     f"No MLflow run found for job {job_name}. This might be expected."
-                )
+                )  # File only
             else:
+                # logger.warning goes to console and file
                 logger.warning(f"MLflow Error retrieving run for job {job_name}: {e}")
         except Exception as e:
             logger.warning(
                 f"Unexpected Error retrieving MLflow run for job {job_name}: {e}"
-            )
+            )  # Console and file
 
         # --- Job Object Data Extraction ---
+        # (Keep the existing extraction logic using getattr)
+        # ... (all the getattr calls as before) ...
         job_id = getattr(job, "id", None)
         display_name = getattr(job, "display_name", job.name)  # Fallback to name
         job_type = getattr(job, "type", None)
@@ -403,25 +510,24 @@ def extract_all_jobs(client: MLClient) -> Iterator[JobMetadata]:
         environment_obj = getattr(job, "environment", None)
         if environment_obj:
             if isinstance(environment_obj, str):
-                # Assume it's an ARM ID or shorthand like azureml:name@version
                 environment_id = environment_obj
-                # Try to parse name from ID string if possible (basic parsing)
-                if ":" in environment_obj:
-                    parts = environment_obj.split("/")
-                    if len(parts) > 1 and "@" in parts[-1]:
-                        environment_name = parts[-1]
-                    elif len(parts) > 1:
-                        environment_name = parts[-1]  # Fallback to last segment
-                else:
-                    environment_name = environment_obj  # If just 'name@version'
+                # Basic name parsing attempt
+                parts = environment_obj.split("/")
+                name_part = parts[-1]
+                if ":" in name_part and "@" in name_part:  # versioned asset ID
+                    environment_name = name_part.split("@")[
+                        0
+                    ]  # Get name before @version
+                elif ":" in name_part:  # shorthand name:version
+                    environment_name = name_part
+                else:  # Treat as just name if no : or @
+                    environment_name = name_part
+
             elif hasattr(environment_obj, "name"):
                 environment_name = environment_obj.name
-                # Check if environment_obj itself might be the ID string? Less likely now.
                 if hasattr(environment_obj, "id"):
                     environment_id = environment_obj.id
-                elif isinstance(
-                    environment_obj, str
-                ):  # Double check, SDK might be inconsistent
+                elif isinstance(environment_obj, str):
                     environment_id = str(environment_obj)
 
         # Compute (Name vs ID vs Type)
@@ -429,10 +535,7 @@ def extract_all_jobs(client: MLClient) -> Iterator[JobMetadata]:
         compute_type = None
         if job_properties:
             compute_type = job_properties.get("_azureml.ComputeTargetType")
-            # REST schema shows properties.computeId, let's check if it's in job.properties
-            compute_id_from_props = job_properties.get(
-                "computeId"
-            )  # Or maybe job.properties['computeId']? Unsure
+            compute_id_from_props = job_properties.get("computeId")
 
         # Resources (Instance Count/Type)
         instance_count = None
@@ -442,60 +545,58 @@ def extract_all_jobs(client: MLClient) -> Iterator[JobMetadata]:
             instance_type = getattr(job.resources, "instance_type", None)
 
         # Creation / Modification Context
-        created_at = None
-        created_by = None
-        created_by_type = None
-        last_modified_at = None
-        last_modified_by = None
-        last_modified_by_type = None
-        if hasattr(job, "creation_context"):
-            created_at = safe_isoformat(
-                getattr(job.creation_context, "created_at", None)
-            )
-            created_by = getattr(job.creation_context, "created_by", None)
-            created_by_type = getattr(job.creation_context, "created_by_type", None)
-            last_modified_at = safe_isoformat(
-                getattr(job.creation_context, "last_modified_at", None)
-            )
-            last_modified_by = getattr(job.creation_context, "last_modified_by", None)
-            last_modified_by_type = getattr(
-                job.creation_context, "last_modified_by_type", None
-            )
+        created_at_dt = (
+            getattr(job.creation_context, "created_at", None)
+            if hasattr(job, "creation_context")
+            else None
+        )
+        created_at = safe_isoformat(created_at_dt)
+        created_by = (
+            getattr(job.creation_context, "created_by", None)
+            if hasattr(job, "creation_context")
+            else None
+        )
+        created_by_type = (
+            getattr(job.creation_context, "created_by_type", None)
+            if hasattr(job, "creation_context")
+            else None
+        )
+        last_modified_at_dt = (
+            getattr(job.creation_context, "last_modified_at", None)
+            if hasattr(job, "creation_context")
+            else None
+        )
+        last_modified_at = safe_isoformat(last_modified_at_dt)
+        last_modified_by = (
+            getattr(job.creation_context, "last_modified_by", None)
+            if hasattr(job, "creation_context")
+            else None
+        )
+        last_modified_by_type = (
+            getattr(job.creation_context, "last_modified_by_type", None)
+            if hasattr(job, "creation_context")
+            else None
+        )
 
         # Start/End Time & Duration
-        start_time = None
-        end_time = None
-        duration_seconds = None
+        prop_start = job_properties.get("StartTimeUtc") if job_properties else None
+        prop_end = job_properties.get("EndTimeUtc") if job_properties else None
 
-        if mlflow_start_time_ms is not None:
-            start_time = safe_isoformat(mlflow_start_time_ms)
-        elif job_properties and "StartTimeUtc" in job_properties:
-            start_time = safe_isoformat(job_properties["StartTimeUtc"])
-        # else: start_time remains None
-
-        if mlflow_end_time_ms is not None:
-            end_time = safe_isoformat(mlflow_end_time_ms)
-        elif job_properties and "EndTimeUtc" in job_properties:
-            end_time = safe_isoformat(job_properties["EndTimeUtc"])
-        # else: end_time remains None
-
-        # Calculate duration using the determined start/end times (could be ms, iso str, or datetime)
-        start_source = (
-            mlflow_start_time_ms
-            if mlflow_start_time_ms
-            else (job_properties.get("StartTimeUtc") if job_properties else None)
+        start_time_raw = (
+            mlflow_start_time_ms if mlflow_start_time_ms is not None else prop_start
         )
-        end_source = (
-            mlflow_end_time_ms
-            if mlflow_end_time_ms
-            else (job_properties.get("EndTimeUtc") if job_properties else None)
+        end_time_raw = (
+            mlflow_end_time_ms if mlflow_end_time_ms is not None else prop_end
         )
-        duration_seconds = safe_duration(start_source, end_source)
+
+        start_time = safe_isoformat(start_time_raw)
+        end_time = safe_isoformat(end_time_raw)
+        duration_seconds = safe_duration(start_time_raw, end_time_raw)
 
         # --- Assemble JobMetadata ---
         jm = JobMetadata(
             # Core Identifiers
-            name=job_name,  # Use the name we used to retrieve the job
+            name=job_name,
             id=job_id,
             display_name=display_name,
             job_type=job_type,
@@ -517,16 +618,16 @@ def extract_all_jobs(client: MLClient) -> Iterator[JobMetadata]:
             last_modified_by_type=last_modified_by_type,
             # Execution Details
             command=command,
-            script_name=script_name,  # From MLflow
+            script_name=script_name,
             environment_name=environment_name,
             environment_id=environment_id,
             environment_variables=environment_variables,
             code_id=code_id,
-            arguments=None,  # Keeping separate from command/job_parameters for now
+            arguments=None,  # Keeping separate
             job_parameters=job_parameters,
             # Compute Details
             compute_target=compute_target_name,
-            compute_id=compute_id_from_props,  # Prefer value from properties if available
+            compute_id=compute_id_from_props,
             compute_type=compute_type,
             instance_count=instance_count,
             instance_type=instance_type,
@@ -571,21 +672,29 @@ def extract_all_jobs(client: MLClient) -> Iterator[JobMetadata]:
 
 def main(source_config: str, output_path: str):
     """Main function to extract job metadata and save to JSON."""
+    # Setup logging handlers first
+    setup_logging()
+
     try:
         source_client = get_ml_client(source_config)
-        logger.info(f"Connected to workspace: {source_client.workspace_name}")
+        # Use print for user-facing info to stdout
+        print(f"Connected to workspace: {source_client.workspace_name}")
     except Exception as e:
+        # logger.error goes to console and file
         logger.error(
             f"Failed to connect to source workspace using config {source_config}: {e}"
         )
         return
 
     output_dir = os.path.dirname(output_path)
-    if (
-        output_dir
-    ):  # Ensure directory exists only if output_path includes a directory part
-        os.makedirs(output_dir, exist_ok=True)
-        logger.info(f"Output directory ensured: {output_dir}")
+    if output_dir:
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            # Use print for user-facing info to stdout
+            print(f"Output directory ensured: {output_dir}")
+        except OSError as e:
+            logger.error(f"Failed to create output directory {output_dir}: {e}")
+            return
 
     job_count = 0
     first_item = True
@@ -595,9 +704,9 @@ def main(source_config: str, output_path: str):
 
             for job_metadata in extract_all_jobs(source_client):
                 try:
-                    # Use the custom to_dict method for better serialization control
                     job_dict = job_metadata.to_dict()
-                    job_json = json.dumps(job_dict, indent=2)
+                    # Use ensure_ascii=False for better handling of non-ASCII chars
+                    job_json = json.dumps(job_dict, indent=2, ensure_ascii=False)
 
                     if not first_item:
                         f.write(",\n")
@@ -607,31 +716,32 @@ def main(source_config: str, output_path: str):
                     f.write(job_json)
                     job_count += 1
 
-                    # Optional: Provide less frequent updates with tqdm
-                    # if job_count % 50 == 0:
-                    #     logger.info(f"Processed {job_count} jobs so far...")
-
                 except TypeError as e:
                     logger.error(
                         f"Serialization Error for job {job_metadata.name}: {e}. Skipping this job."
                     )
+                    # Log the problematic object structure to the file for debugging
                     logger.debug(
-                        f"Problematic JobMetadata: {job_metadata}"
-                    )  # Log full object for debugging
+                        f"Problematic JobMetadata causing TypeError: {job_metadata!r}"
+                    )
                 except Exception as e:
                     logger.error(
                         f"Unexpected error processing/writing job {job_metadata.name}: {e}. Skipping this job."
                     )
-                    logger.debug(f"Problematic JobMetadata: {job_metadata}")
+                    logger.debug(
+                        f"Problematic JobMetadata causing Exception: {job_metadata!r}"
+                    )
 
             f.write("\n]")
 
-        logger.info(f"Successfully extracted {job_count} jobs to {output_path}")
+        # Use print for final summary to stdout
+        print(f"\nSuccessfully extracted {job_count} jobs to {output_path}")
 
     except IOError as e:
         logger.error(f"Failed to write to output file {output_path}: {e}")
     except Exception as e:
-        logger.error(f"An unexpected error occurred during extraction: {e}")
+        # Use logger.exception to include traceback in the log file
+        logger.exception(f"An unexpected error occurred during extraction: {e}")
 
 
 if __name__ == "__main__":
