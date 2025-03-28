@@ -351,6 +351,9 @@ class JobMetadata:
     mlflow_tags: Optional[Dict[str, str]] = None  # From run.data.tags
     mlflow_dataset_inputs: Optional[List[Any]] = None  # From run.inputs.dataset_inputs
 
+    # Add a field to store child run names/ids if needed directly on parent. Optional.
+    child_run_ids: Optional[List[str]] = None
+
     def to_dict(self):
         """Convert dataclass to dictionary, handling complex types."""
         d = {}
@@ -363,324 +366,379 @@ class JobMetadata:
         return d
 
 
-# --- Extraction Logic (Keep as before, logging goes to handlers) ---
+# --- Extraction Logic ---
+
+
+def _process_job_object(job: Job, mlflow_client: MlflowClient) -> Optional[JobMetadata]:
+    """
+    Processes a single Azure ML Job object (parent or child)
+    and returns its JobMetadata.
+    Returns None if the job object itself is invalid or causes critical errors.
+    """
+    job_name = job.name  # Use the name from the passed Job object
+    logger.info(f"Processing job object: {job_name} (Type: {job.type})")
+
+    # --- MLflow Data Extraction ---
+    mlflow_run: Optional[MlflowRun] = None
+    mlflow_metrics = {}
+    mlflow_params = {}
+    mlflow_tags_dict = {}
+    mlflow_dataset_inputs = None
+    mlflow_run_id = None
+    mlflow_run_name = None
+    mlflow_experiment_id = None
+    mlflow_user_id = None
+    mlflow_artifact_uri = None
+    mlflow_start_time_ms = None
+    mlflow_end_time_ms = None
+    script_name = None
+
+    try:
+        mlflow_run = mlflow_client.get_run(job_name)  # Use job_name which IS the run_id
+        if mlflow_run:
+            logger.debug(f"Found MLflow run for job {job_name}")
+            if mlflow_run.data:
+                mlflow_metrics = mlflow_run.data.metrics or {}
+                mlflow_params = mlflow_run.data.params or {}
+                mlflow_tags_dict = mlflow_run.data.tags or {}
+                script_name = mlflow_tags_dict.get("mlflow.source.name")
+                logger.info(
+                    f"Retrieved {len(mlflow_metrics)} metrics, {len(mlflow_params)} params for MLflow run {job_name}"
+                )
+            if mlflow_run.info:
+                mlflow_run_id = mlflow_run.info.run_id
+                mlflow_run_name = mlflow_run.info.run_name
+                mlflow_experiment_id = mlflow_run.info.experiment_id
+                mlflow_user_id = mlflow_run.info.user_id
+                mlflow_artifact_uri = mlflow_run.info.artifact_uri
+                mlflow_start_time_ms = mlflow_run.info.start_time
+                mlflow_end_time_ms = mlflow_run.info.end_time
+            if hasattr(mlflow_run, "inputs") and hasattr(
+                mlflow_run.inputs, "dataset_inputs"
+            ):
+                mlflow_dataset_inputs = convert_complex_dict(
+                    mlflow_run.inputs.dataset_inputs
+                )
+
+    except MlflowException as e:
+        if "RESOURCE_DOES_NOT_EXIST" in str(e) or (
+            "Run with id=" in str(e) and "not found" in str(e)
+        ):
+            logger.info(
+                f"No MLflow run found for job {job_name}. This might be expected."
+            )
+        else:
+            logger.warning(f"MLflow Error retrieving run for job {job_name}: {e}")
+    except Exception as e:
+        logger.warning(
+            f"Unexpected Error retrieving MLflow run for job {job_name}: {e}"
+        )
+
+    # --- Job Object Data Extraction ---
+    # (Use the SAME getattr logic as before, applied to the 'job' object passed in)
+    # ... (all the getattr calls: job_id, display_name, job_type, status, etc.) ...
+    job_id = getattr(job, "id", None)
+    display_name = getattr(job, "display_name", job.name)
+    job_type = getattr(job, "type", None)
+    status = getattr(job, "status", None)
+    experiment_name = getattr(job, "experiment_name", None)
+    # Crucially, get parent_job_name from the job object itself
+    parent_job_name = getattr(job, "parent_job_name", None)
+    description = getattr(job, "description", None)
+    tags = getattr(job, "tags", {})
+    command = getattr(job, "command", None)
+    job_parameters = getattr(job, "parameters", None)
+    environment_variables = getattr(job, "environment_variables", None)
+    code_obj = getattr(job, "code", None)
+    code_id = str(code_obj) if code_obj else None
+    compute_target_name = getattr(job, "compute", None)
+    job_inputs = getattr(job, "inputs", None)
+    job_outputs = getattr(job, "outputs", None)
+    identity_obj = getattr(job, "identity", None)
+    identity_type = getattr(identity_obj, "type", None) if identity_obj else None
+    services = getattr(job, "services", None)
+    job_properties = getattr(job, "properties", None)
+
+    # Specific Job Type Fields
+    distribution = getattr(job, "distribution", None)
+    job_limits = getattr(job, "limits", None)
+    task_details = getattr(job, "task_details", None)
+    objective = getattr(job, "objective", None)
+    search_space = getattr(job, "search_space", None)
+    sampling_algorithm = getattr(job, "sampling_algorithm", None)
+    early_termination = getattr(job, "early_termination", None)
+    trial_component = getattr(job, "trial", None)
+    pipeline_settings = getattr(job, "settings", None)
+    pipeline_sub_jobs = getattr(
+        job, "jobs", None
+    )  # Note: This usually just has keys, not full objects
+
+    # Environment
+    environment_name = None
+    environment_id = None
+    environment_obj = getattr(job, "environment", None)
+    if environment_obj:
+        if isinstance(environment_obj, str):
+            environment_id = environment_obj
+            parts = environment_obj.split("/")
+            name_part = parts[-1]
+            if ":" in name_part and "@" in name_part:
+                environment_name = name_part.split("@")[0]
+            elif ":" in name_part:
+                environment_name = name_part
+            else:
+                environment_name = name_part
+        elif hasattr(environment_obj, "name"):
+            environment_name = environment_obj.name
+            if hasattr(environment_obj, "id"):
+                environment_id = environment_obj.id
+            elif isinstance(environment_obj, str):
+                environment_id = str(environment_obj)
+
+    # Compute
+    compute_id_from_props = None
+    compute_type = None
+    if job_properties:
+        compute_type = job_properties.get("_azureml.ComputeTargetType")
+        compute_id_from_props = job_properties.get("computeId")
+
+    # Resources
+    instance_count = None
+    instance_type = None
+    if hasattr(job, "resources"):
+        instance_count = getattr(job.resources, "instance_count", None)
+        instance_type = getattr(job.resources, "instance_type", None)
+
+    # Creation / Modification Context
+    created_at_dt = (
+        getattr(job.creation_context, "created_at", None)
+        if hasattr(job, "creation_context")
+        else None
+    )
+    created_at = safe_isoformat(created_at_dt)
+    created_by = (
+        getattr(job.creation_context, "created_by", None)
+        if hasattr(job, "creation_context")
+        else None
+    )
+    created_by_type = (
+        getattr(job.creation_context, "created_by_type", None)
+        if hasattr(job, "creation_context")
+        else None
+    )
+    last_modified_at_dt = (
+        getattr(job.creation_context, "last_modified_at", None)
+        if hasattr(job, "creation_context")
+        else None
+    )
+    last_modified_at = safe_isoformat(last_modified_at_dt)
+    last_modified_by = (
+        getattr(job.creation_context, "last_modified_by", None)
+        if hasattr(job, "creation_context")
+        else None
+    )
+    last_modified_by_type = (
+        getattr(job.creation_context, "last_modified_by_type", None)
+        if hasattr(job, "creation_context")
+        else None
+    )
+
+    # Start/End Time & Duration
+    prop_start = job_properties.get("StartTimeUtc") if job_properties else None
+    prop_end = job_properties.get("EndTimeUtc") if job_properties else None
+    start_time_raw = (
+        mlflow_start_time_ms if mlflow_start_time_ms is not None else prop_start
+    )
+    end_time_raw = mlflow_end_time_ms if mlflow_end_time_ms is not None else prop_end
+    start_time = safe_isoformat(start_time_raw)
+    end_time = safe_isoformat(end_time_raw)
+    duration_seconds = safe_duration(start_time_raw, end_time_raw)
+
+    # --- Assemble JobMetadata ---
+    jm = JobMetadata(
+        # Core Identifiers
+        name=job_name,  # Use the name from the Job object
+        id=job_id,
+        display_name=display_name,
+        job_type=job_type,
+        status=status,
+        # Hierarchy and Context
+        experiment_name=experiment_name,
+        parent_job_name=parent_job_name,  # Get directly from job object
+        # Timestamps and Duration
+        created_at=created_at,
+        start_time=start_time,
+        end_time=end_time,
+        duration_seconds=duration_seconds,
+        # Creator Info
+        created_by=created_by,
+        created_by_type=created_by_type,
+        # Modification Info
+        last_modified_at=last_modified_at,
+        last_modified_by=last_modified_by,
+        last_modified_by_type=last_modified_by_type,
+        # Execution Details
+        command=command,
+        script_name=script_name,
+        environment_name=environment_name,
+        environment_id=environment_id,
+        environment_variables=environment_variables,
+        code_id=code_id,
+        arguments=None,
+        job_parameters=job_parameters,
+        # Compute Details
+        compute_target=compute_target_name,
+        compute_id=compute_id_from_props,
+        compute_type=compute_type,
+        instance_count=instance_count,
+        instance_type=instance_type,
+        # Job Specific Configuration
+        distribution=distribution,
+        job_limits=job_limits,
+        job_inputs=job_inputs,
+        job_outputs=job_outputs,
+        identity_type=identity_type,
+        services=services,
+        job_properties=job_properties,
+        # AutoML/Sweep Specific
+        task_details=task_details,
+        objective=objective,
+        search_space=search_space,
+        sampling_algorithm=sampling_algorithm,
+        early_termination=early_termination,
+        trial_component=trial_component,
+        # Pipeline Specific
+        pipeline_settings=pipeline_settings,
+        pipeline_sub_jobs=pipeline_sub_jobs,  # Still just keys here
+        # Metadata
+        description=description,
+        tags=tags,
+        # MLflow Specific Data
+        mlflow_run_id=mlflow_run_id,
+        mlflow_run_name=mlflow_run_name,
+        mlflow_experiment_id=mlflow_experiment_id,
+        mlflow_user_id=mlflow_user_id,
+        mlflow_artifact_uri=mlflow_artifact_uri,
+        mlflow_metrics=mlflow_metrics,
+        mlflow_params=mlflow_params,
+        mlflow_tags=mlflow_tags_dict,
+        mlflow_dataset_inputs=mlflow_dataset_inputs,
+    )
+    return jm
 
 
 def extract_all_jobs(client: MLClient) -> Iterator[JobMetadata]:
-    """Extract all jobs from the AzureML workspace and yield them one by one."""
-    # Logger is already configured by setup_logging()
-
+    """
+    Extract all top-level jobs AND their child jobs (for pipelines)
+    from the AzureML workspace and yield them one by one.
+    """
     mlflow_tracking_uri = client.workspaces.get(
         client.workspace_name
     ).mlflow_tracking_uri
 
-    # Use logger.info - this will go to the file
     logger.info(f"Using MLflow tracking URI: {mlflow_tracking_uri}")
     mlflow.set_tracking_uri(mlflow_tracking_uri)
     mlflow_client = MlflowClient()
 
     all_job_summaries = []
     try:
-        # This might still log INFO messages from the SDK to the file
+        # Get only top-level jobs initially
         all_job_summaries = list(client.jobs.list())
     except Exception as e:
-        logger.error(f"Failed to list job summaries: {e}")
-        return  # Stop if listing fails
+        logger.exception(f"Failed to list initial job summaries: {e}")
+        return
 
-    # Use print for user-facing info to stdout
-    print(f"Found {len(all_job_summaries)} total job summaries. Starting extraction...")
+    print(
+        f"Found {len(all_job_summaries)} total top-level job summaries. Starting extraction including children..."
+    )
 
-    # tqdm writes to stderr by default, which is fine
-    for job_summary in tqdm(all_job_summaries, desc="Processing Jobs", unit="job"):
-        job_name = job_summary.name
-        # Reduce verbosity in loop, details go to file via logger
-        # logger.info(f"Processing job: {job_name}")
+    # Use total=len(all_job_summaries) for tqdm based on top-level jobs
+    for job_summary in tqdm(
+        all_job_summaries, desc="Processing Top-Level Jobs", unit="job"
+    ):
+        parent_job_name = job_summary.name
 
+        # 1. Get and Process the Parent/Top-Level Job
         try:
-            job: Job = client.jobs.get(name=job_name)
+            parent_job_object: Job = client.jobs.get(name=parent_job_name)
         except ResourceNotFoundError:
-            logger.warning(f"Job {job_name} not found via client.jobs.get(). Skipping.")
+            logger.warning(
+                f"Top-level job {parent_job_name} summary found but GET failed (not found). Skipping."
+            )
             continue
         except Exception as e:
-            # logger.error will go to console and file
-            logger.error(f"Failed to retrieve full job details for {job_name}: {e}")
+            logger.error(
+                f"Failed to retrieve full job details for top-level job {parent_job_name}: {e}. Skipping."
+            )
             continue
 
-        # --- MLflow Data Extraction ---
-        mlflow_run: Optional[MlflowRun] = None
-        mlflow_metrics = {}
-        mlflow_params = {}
-        mlflow_tags_dict = {}
-        mlflow_dataset_inputs = None
-        mlflow_run_id = None
-        mlflow_run_name = None
-        mlflow_experiment_id = None
-        mlflow_user_id = None
-        mlflow_artifact_uri = None
-        mlflow_start_time_ms = None
-        mlflow_end_time_ms = None
-        script_name = None
+        parent_metadata = _process_job_object(parent_job_object, mlflow_client)
 
-        try:
-            mlflow_run = mlflow_client.get_run(job_name)
-            if mlflow_run:
-                logger.debug(
-                    f"Found MLflow run for job {job_name}"
-                )  # DEBUG won't show on console
-                if mlflow_run.data:
-                    mlflow_metrics = mlflow_run.data.metrics or {}
-                    mlflow_params = mlflow_run.data.params or {}
-                    mlflow_tags_dict = mlflow_run.data.tags or {}
-                    script_name = mlflow_tags_dict.get("mlflow.source.name")
+        if parent_metadata:
+            yield parent_metadata  # Yield the parent first
+
+            # 2. If it's a Pipeline, find and process its children
+            if parent_metadata.job_type == "pipeline":
+                logger.info(
+                    f"Pipeline job '{parent_job_name}' detected. Querying for child jobs..."
+                )
+                try:
+                    # Use parent_job_name to list children
+                    child_job_summaries = list(
+                        client.jobs.list(parent_job_name=parent_job_name)
+                    )
                     logger.info(
-                        f"Retrieved {len(mlflow_metrics)} metrics, {len(mlflow_params)} params for MLflow run {job_name}"
-                    )  # Goes to file
-                if mlflow_run.info:
-                    mlflow_run_id = mlflow_run.info.run_id
-                    mlflow_run_name = mlflow_run.info.run_name
-                    mlflow_experiment_id = mlflow_run.info.experiment_id
-                    mlflow_user_id = mlflow_run.info.user_id
-                    mlflow_artifact_uri = mlflow_run.info.artifact_uri
-                    mlflow_start_time_ms = mlflow_run.info.start_time
-                    mlflow_end_time_ms = mlflow_run.info.end_time
-                if hasattr(mlflow_run, "inputs") and hasattr(
-                    mlflow_run.inputs, "dataset_inputs"
-                ):
-                    # Convert dataset inputs safely for JSON
-                    mlflow_dataset_inputs = convert_complex_dict(
-                        mlflow_run.inputs.dataset_inputs
+                        f"Found {len(child_job_summaries)} child jobs for '{parent_job_name}'."
                     )
 
-        except MlflowException as e:
-            if "RESOURCE_DOES_NOT_EXIST" in str(e) or (
-                "Run with id=" in str(e) and "not found" in str(e)
-            ):
-                logger.info(
-                    f"No MLflow run found for job {job_name}. This might be expected."
-                )  # File only
-            else:
-                # logger.warning goes to console and file
-                logger.warning(f"MLflow Error retrieving run for job {job_name}: {e}")
-        except Exception as e:
-            logger.warning(
-                f"Unexpected Error retrieving MLflow run for job {job_name}: {e}"
-            )  # Console and file
+                    for child_summary in child_job_summaries:
+                        child_job_name = child_summary.name
+                        try:
+                            child_job_object: Job = client.jobs.get(name=child_job_name)
+                            child_metadata = _process_job_object(
+                                child_job_object, mlflow_client
+                            )
+                            if child_metadata:
+                                # Double-check parent name consistency (should be set by _process_job_object already)
+                                if child_metadata.parent_job_name != parent_job_name:
+                                    logger.info(
+                                        f"Child job {child_job_name} has unexpected parent '{child_metadata.parent_job_name}', expected '{parent_job_name}'. Overwriting."
+                                    )  # This happens consistently (100%) and therefore should not be a warning
+                                    child_metadata.parent_job_name = parent_job_name
+                                yield child_metadata  # Yield the child
+                            else:
+                                logger.warning(
+                                    f"Failed to process child job object {child_job_name} for parent {parent_job_name}."
+                                )
 
-        # --- Job Object Data Extraction ---
-        # (Keep the existing extraction logic using getattr)
-        # ... (all the getattr calls as before) ...
-        job_id = getattr(job, "id", None)
-        display_name = getattr(job, "display_name", job.name)  # Fallback to name
-        job_type = getattr(job, "type", None)
-        status = getattr(job, "status", None)
-        experiment_name = getattr(job, "experiment_name", None)
-        parent_job_name = getattr(job, "parent_job_name", None)
-        description = getattr(job, "description", None)
-        tags = getattr(job, "tags", {})
-        command = getattr(job, "command", None)  # Specific to CommandJob primarily
-        job_parameters = getattr(job, "parameters", None)  # Specific to CommandJob
-        environment_variables = getattr(job, "environment_variables", None)
-        code_obj = getattr(job, "code", None)
-        code_id = (
-            str(code_obj) if code_obj else None
-        )  # Store as string (can be path or ARM ID)
-        compute_target_name = getattr(job, "compute", None)
-        job_inputs = getattr(job, "inputs", None)
-        job_outputs = getattr(job, "outputs", None)
-        identity_obj = getattr(job, "identity", None)
-        identity_type = getattr(identity_obj, "type", None) if identity_obj else None
-        services = getattr(job, "services", None)
-        job_properties = getattr(job, "properties", None)  # Generic properties dict
+                        except ResourceNotFoundError:
+                            logger.warning(
+                                f"Child job {child_job_name} listed but GET failed (not found) for parent {parent_job_name}. Skipping child."
+                            )
+                        except Exception as e:
+                            logger.error(
+                                f"Failed to retrieve or process child job {child_job_name} for parent {parent_job_name}: {e}"
+                            )
 
-        # Specific Job Type Fields
-        distribution = getattr(job, "distribution", None)
-        job_limits = getattr(job, "limits", None)
-        task_details = getattr(job, "task_details", None)  # AutoML
-        objective = getattr(job, "objective", None)  # Sweep
-        search_space = getattr(job, "search_space", None)  # Sweep
-        sampling_algorithm = getattr(job, "sampling_algorithm", None)  # Sweep
-        early_termination = getattr(job, "early_termination", None)  # Sweep
-        trial_component = getattr(job, "trial", None)  # Sweep
-        pipeline_settings = getattr(job, "settings", None)  # Pipeline
-        pipeline_sub_jobs = getattr(job, "jobs", None)  # Pipeline
-
-        # Environment (Name vs ID)
-        environment_name = None
-        environment_id = None
-        environment_obj = getattr(job, "environment", None)
-        if environment_obj:
-            if isinstance(environment_obj, str):
-                environment_id = environment_obj
-                # Basic name parsing attempt
-                parts = environment_obj.split("/")
-                name_part = parts[-1]
-                if ":" in name_part and "@" in name_part:  # versioned asset ID
-                    environment_name = name_part.split("@")[
-                        0
-                    ]  # Get name before @version
-                elif ":" in name_part:  # shorthand name:version
-                    environment_name = name_part
-                else:  # Treat as just name if no : or @
-                    environment_name = name_part
-
-            elif hasattr(environment_obj, "name"):
-                environment_name = environment_obj.name
-                if hasattr(environment_obj, "id"):
-                    environment_id = environment_obj.id
-                elif isinstance(environment_obj, str):
-                    environment_id = str(environment_obj)
-
-        # Compute (Name vs ID vs Type)
-        compute_id_from_props = None
-        compute_type = None
-        if job_properties:
-            compute_type = job_properties.get("_azureml.ComputeTargetType")
-            compute_id_from_props = job_properties.get("computeId")
-
-        # Resources (Instance Count/Type)
-        instance_count = None
-        instance_type = None
-        if hasattr(job, "resources"):
-            instance_count = getattr(job.resources, "instance_count", None)
-            instance_type = getattr(job.resources, "instance_type", None)
-
-        # Creation / Modification Context
-        created_at_dt = (
-            getattr(job.creation_context, "created_at", None)
-            if hasattr(job, "creation_context")
-            else None
-        )
-        created_at = safe_isoformat(created_at_dt)
-        created_by = (
-            getattr(job.creation_context, "created_by", None)
-            if hasattr(job, "creation_context")
-            else None
-        )
-        created_by_type = (
-            getattr(job.creation_context, "created_by_type", None)
-            if hasattr(job, "creation_context")
-            else None
-        )
-        last_modified_at_dt = (
-            getattr(job.creation_context, "last_modified_at", None)
-            if hasattr(job, "creation_context")
-            else None
-        )
-        last_modified_at = safe_isoformat(last_modified_at_dt)
-        last_modified_by = (
-            getattr(job.creation_context, "last_modified_by", None)
-            if hasattr(job, "creation_context")
-            else None
-        )
-        last_modified_by_type = (
-            getattr(job.creation_context, "last_modified_by_type", None)
-            if hasattr(job, "creation_context")
-            else None
-        )
-
-        # Start/End Time & Duration
-        prop_start = job_properties.get("StartTimeUtc") if job_properties else None
-        prop_end = job_properties.get("EndTimeUtc") if job_properties else None
-
-        start_time_raw = (
-            mlflow_start_time_ms if mlflow_start_time_ms is not None else prop_start
-        )
-        end_time_raw = (
-            mlflow_end_time_ms if mlflow_end_time_ms is not None else prop_end
-        )
-
-        start_time = safe_isoformat(start_time_raw)
-        end_time = safe_isoformat(end_time_raw)
-        duration_seconds = safe_duration(start_time_raw, end_time_raw)
-
-        # --- Assemble JobMetadata ---
-        jm = JobMetadata(
-            # Core Identifiers
-            name=job_name,
-            id=job_id,
-            display_name=display_name,
-            job_type=job_type,
-            status=status,
-            # Hierarchy and Context
-            experiment_name=experiment_name,
-            parent_job_name=parent_job_name,
-            # Timestamps and Duration
-            created_at=created_at,
-            start_time=start_time,
-            end_time=end_time,
-            duration_seconds=duration_seconds,
-            # Creator Info
-            created_by=created_by,
-            created_by_type=created_by_type,
-            # Modification Info
-            last_modified_at=last_modified_at,
-            last_modified_by=last_modified_by,
-            last_modified_by_type=last_modified_by_type,
-            # Execution Details
-            command=command,
-            script_name=script_name,
-            environment_name=environment_name,
-            environment_id=environment_id,
-            environment_variables=environment_variables,
-            code_id=code_id,
-            arguments=None,  # Keeping separate
-            job_parameters=job_parameters,
-            # Compute Details
-            compute_target=compute_target_name,
-            compute_id=compute_id_from_props,
-            compute_type=compute_type,
-            instance_count=instance_count,
-            instance_type=instance_type,
-            # Job Specific Configuration
-            distribution=distribution,
-            job_limits=job_limits,
-            job_inputs=job_inputs,
-            job_outputs=job_outputs,
-            identity_type=identity_type,
-            services=services,
-            job_properties=job_properties,
-            # AutoML/Sweep Specific
-            task_details=task_details,
-            objective=objective,
-            search_space=search_space,
-            sampling_algorithm=sampling_algorithm,
-            early_termination=early_termination,
-            trial_component=trial_component,
-            # Pipeline Specific
-            pipeline_settings=pipeline_settings,
-            pipeline_sub_jobs=pipeline_sub_jobs,
-            # Metadata
-            description=description,
-            tags=tags,
-            # MLflow Specific Data
-            mlflow_run_id=mlflow_run_id,
-            mlflow_run_name=mlflow_run_name,
-            mlflow_experiment_id=mlflow_experiment_id,
-            mlflow_user_id=mlflow_user_id,
-            mlflow_artifact_uri=mlflow_artifact_uri,
-            mlflow_metrics=mlflow_metrics,
-            mlflow_params=mlflow_params,
-            mlflow_tags=mlflow_tags_dict,
-            mlflow_dataset_inputs=mlflow_dataset_inputs,
-        )
-
-        yield jm
+                except Exception as e:
+                    logger.error(
+                        f"Failed to list or process child jobs for pipeline {parent_job_name}: {e}"
+                    )
+        else:
+            logger.warning(f"Failed to process top-level job object {parent_job_name}.")
 
 
 # --- Main Execution ---
 
 
 def main(source_config: str, output_path: str):
-    """Main function to extract job metadata and save to JSON."""
-    # Setup logging handlers first
+    # ... (logging setup, client connection, output dir creation as before) ...
     setup_logging()
 
     try:
         source_client = get_ml_client(source_config)
-        # Use print for user-facing info to stdout
         print(f"Connected to workspace: {source_client.workspace_name}")
     except Exception as e:
-        # logger.error goes to console and file
         logger.error(
             f"Failed to connect to source workspace using config {source_config}: {e}"
         )
@@ -690,7 +748,6 @@ def main(source_config: str, output_path: str):
     if output_dir:
         try:
             os.makedirs(output_dir, exist_ok=True)
-            # Use print for user-facing info to stdout
             print(f"Output directory ensured: {output_dir}")
         except OSError as e:
             logger.error(f"Failed to create output directory {output_dir}: {e}")
@@ -702,10 +759,10 @@ def main(source_config: str, output_path: str):
         with open(output_path, "w", encoding="utf-8") as f:
             f.write("[\n")
 
+            # The iterator now yields parents AND children sequentially
             for job_metadata in extract_all_jobs(source_client):
                 try:
                     job_dict = job_metadata.to_dict()
-                    # Use ensure_ascii=False for better handling of non-ASCII chars
                     job_json = json.dumps(job_dict, indent=2, ensure_ascii=False)
 
                     if not first_item:
@@ -714,13 +771,12 @@ def main(source_config: str, output_path: str):
                         first_item = False
 
                     f.write(job_json)
-                    job_count += 1
+                    job_count += 1  # Count total jobs written (parents + children)
 
                 except TypeError as e:
                     logger.error(
                         f"Serialization Error for job {job_metadata.name}: {e}. Skipping this job."
                     )
-                    # Log the problematic object structure to the file for debugging
                     logger.debug(
                         f"Problematic JobMetadata causing TypeError: {job_metadata!r}"
                     )
@@ -734,18 +790,21 @@ def main(source_config: str, output_path: str):
 
             f.write("\n]")
 
-        # Use print for final summary to stdout
-        print(f"\nSuccessfully extracted {job_count} jobs to {output_path}")
+        # Update final message to reflect total jobs found
+        print(
+            f"\nSuccessfully extracted {job_count} total jobs (including pipeline children) to {output_path}"
+        )
 
     except IOError as e:
         logger.error(f"Failed to write to output file {output_path}: {e}")
     except Exception as e:
-        # Use logger.exception to include traceback in the log file
         logger.exception(f"An unexpected error occurred during extraction: {e}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Extract AzureML job metadata to JSON")
+    parser = argparse.ArgumentParser(
+        description="Extract AzureML job metadata (including pipeline children) to JSON"
+    )
     parser.add_argument(
         "--source", required=True, help="Path to source workspace config JSON"
     )
