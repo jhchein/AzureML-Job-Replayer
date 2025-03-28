@@ -1,0 +1,10 @@
+[project]
+name = "azureml-job-replayer"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "azure-ai-ml>=1.26.0",
+    "azure-identity>=1.21.0",
+]
