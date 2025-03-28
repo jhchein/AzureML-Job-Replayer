@@ -174,4 +174,5 @@ cython_debug/
 .pypirc
 
 config/*.json
-data/*
+data/*.json
+logs/*.log

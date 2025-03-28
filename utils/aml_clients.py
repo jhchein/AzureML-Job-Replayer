@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 from azure.ai.ml import MLClient
-from azure.identity import DefaultAzureCredential
+from azure.identity import AzureCliCredential
 
 
 def load_workspace_config(config_path: str) -> dict:
@@ -27,8 +27,9 @@ def get_ml_client(config_path: str) -> MLClient:
     Instantiate an MLClient for the workspace defined in the config JSON.
     """
     cfg = load_workspace_config(config_path)
+
     return MLClient(
-        credential=DefaultAzureCredential(),
+        credential=AzureCliCredential(),
         subscription_id=cfg["subscription_id"],
         resource_group_name=cfg["resource_group"],
         workspace_name=cfg["workspace_name"],
