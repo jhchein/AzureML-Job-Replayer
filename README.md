@@ -64,7 +64,11 @@ Create two workspace config JSONs under `config/`, by renaming `source_config.js
 
 ## 🎯 Usage
 
-Run the main script with source and target config paths:
+You can run the tool in two ways:
+
+### 1️⃣ **Run the Full Workflow with `main.py`**
+
+The `main.py` script combines both the **Extraction** and **Replay** phases into a single command. This is the easiest way to use the tool:
 
 ```bash
 python main.py --source config/source_config.json --target config/target_config.json
@@ -72,16 +76,69 @@ python main.py --source config/source_config.json --target config/target_config.
 
 Options:
 
-- `--filter` Filter jobs by status or name pattern
-- `--dry-run` Validate extraction without submitting to target
-- `--limit` Limit the number of jobs to process (useful for testing)
-- `--output` Specify the path to save extracted job metadata (default: `data/jobs.json`)
+- `--filter`: Filter jobs by status or name pattern
+- `--dry-run`: Validate extraction and replay without submitting jobs to the target workspace
+- `--limit`: Limit the number of jobs to process (useful for testing)
+- `--output`: Specify the path to save extracted job metadata (default: `data/jobs.json`)
 
-### Workflow
+Example:
 
-1. **Extract Phase**: Lists all pipeline and standalone jobs from the source workspace, capturing metadata, metrics, and hierarchy.
-2. **Replay Phase**: Dynamically generates AzureML pipeline definitions in the target workspace. Each step is a dummy component that logs original metrics and tags.
-3. **Validation**: Prints a summary report mapping original job IDs to newly created job IDs.
+```bash
+python main.py --source config/source_config.json --target config/target_config.json --limit 1 --dry-run
+```
+
+This will extract one job from the source workspace and simulate the replay in the target workspace without submitting it.
+
+---
+
+### 2️⃣ **Run Individual Phases**
+
+If you prefer more control, you can run the **Extractor** and **Replayer** separately:
+
+#### 📥 Extraction Phase
+
+Extract jobs from the source workspace and save metadata:
+
+```bash
+python -m extractor.extract_jobs --source config/source_config.json --output data/jobs.json
+```
+
+#### 🔄 Replay Phase
+
+Replay extracted jobs into the target workspace:
+
+```bash
+python -m replayer.build_pipeline --input data/jobs.json --target config/target_config.json
+```
+
+Options:
+
+- `--limit`: Limit the number of jobs to replay (useful for testing)
+- `--dry-run`: Validate replay without submitting jobs to the target workspace
+
+---
+
+### 🚩 Quickstart Example
+
+Run the full workflow with `main.py`:
+
+```bash
+python main.py --source config/source_config.json --target config/target_config.json
+```
+
+Or run the phases individually:
+
+1. Extract jobs:
+
+   ```bash
+   python -m extractor.extract_jobs --source config/source_config.json --output data/jobs.json
+   ```
+
+2. Replay jobs:
+
+   ```bash
+   python -m replayer.build_pipeline --input data/jobs.json --target config/target_config.json
+   ```
 
 ---
 
