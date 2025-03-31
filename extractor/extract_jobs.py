@@ -642,7 +642,6 @@ def extract_all_jobs(client: MLClient) -> Iterator[JobMetadata]:
 
     all_job_summaries = []
     try:
-        # Get only top-level jobs initially
         all_job_summaries = list(client.jobs.list())
     except Exception as e:
         logger.exception(f"Failed to list initial job summaries: {e}")
@@ -652,7 +651,6 @@ def extract_all_jobs(client: MLClient) -> Iterator[JobMetadata]:
         f"Found {len(all_job_summaries)} total top-level job summaries. Starting extraction including children..."
     )
 
-    # Use total=len(all_job_summaries) for tqdm based on top-level jobs
     for job_summary in tqdm(
         all_job_summaries, desc="Processing Top-Level Jobs", unit="job"
     ):

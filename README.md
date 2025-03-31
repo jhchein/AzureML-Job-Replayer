@@ -28,6 +28,7 @@ You may want to:
 - Dummy component steps emit original metrics using `mlflow`
 - Metadata and relationships preserved via tags
 - Supports both standalone and pipeline jobs
+- Dry-run mode for validation without submission
 
 ---
 
@@ -38,6 +39,7 @@ You may want to:
 - `uv` for dependency management (optional)
 
 Install dependencies:
+
 ```bash
 uv install
 # or
@@ -48,7 +50,7 @@ pip install -r requirements.txt
 
 ## 🔧 Configuration
 
-Create two workspace config JSONs under `config/`:
+Create two workspace config JSONs under `config/`, by renaming `source_config.json.example` to `source_config.json` and updating values; similarly create `target_config.json`.
 
 ```jsonc
 {
@@ -57,8 +59,6 @@ Create two workspace config JSONs under `config/`:
   "workspace_name": "<WORKSPACE_NAME>"
 }
 ```
-
-Rename `source_config.json.example` to `source_config.json` and update values; similarly create `target_config.json`.
 
 ---
 
@@ -71,12 +71,15 @@ python main.py --source config/source_config.json --target config/target_config.
 ```
 
 Options:
+
 - `--filter` Filter jobs by status or name pattern
 - `--dry-run` Validate extraction without submitting to target
-
+- `--limit` Limit the number of jobs to process (useful for testing)
+- `--output` Specify the path to save extracted job metadata (default: `data/jobs.json`)
 
 ### Workflow
-1. **Extract Phase**: Lists all pipeline and standalone jobs from source, capturing metadata, metrics, and hierarchy.
+
+1. **Extract Phase**: Lists all pipeline and standalone jobs from the source workspace, capturing metadata, metrics, and hierarchy.
 2. **Replay Phase**: Dynamically generates AzureML pipeline definitions in the target workspace. Each step is a dummy component that logs original metrics and tags.
 3. **Validation**: Prints a summary report mapping original job IDs to newly created job IDs.
 
@@ -85,8 +88,12 @@ Options:
 ## 📈 Example Output
 
 ```text
+--- EXTRACTION PHASE ---
 ✅ Extracted 15 jobs (3 pipelines + 12 child steps) from source workspace.
-✅ Created 3 replay pipelines in target workspace.
+✅ Job metadata saved to data/jobs.json
+
+--- REPLAY PHASE ---
+✅ Submitted 3 replay pipelines in target workspace.
 Mapping:
  - original: job-abc123 → replay: job-def456
  - original: job-xyz789 → replay: job-ghi012
@@ -97,12 +104,9 @@ Mapping:
 ## 🗺️ Roadmap
 
 - [ ] Support artifact copy
-- [ ] Persist job ID mapping to JSON/DB
+- [ ] Support output logs copy
 - [ ] CLI flags for selective job subset
-- [ ] Unit tests & CI
 - [ ] Support job filtering by tags/date ranges
-- [ ] Option to recreate full job input/output datasets
-- [ ] GUI-based selector for pipelines to replay
 
 ---
 
