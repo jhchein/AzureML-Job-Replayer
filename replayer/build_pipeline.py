@@ -9,7 +9,6 @@ from typing import Dict, List, Optional, Tuple
 
 from azure.ai.ml import (
     Input,
-    MLClient,
 )
 from azure.ai.ml.constants import AssetTypes
 from azure.ai.ml.entities import (
@@ -22,7 +21,6 @@ from azure.core.exceptions import HttpResponseError
 
 from extractor.extract_jobs import JobMetadata
 from replayer.dummy_components import (
-    DUMMY_ENV,
     REGISTERED_ENV_ID,
     replay_metrics_component,
 )
@@ -201,25 +199,9 @@ def build_dummy_standalone_job(
 
 
 # --- Main execution logic ---
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Build and submit replay jobs/pipelines"
-    )
-    parser.add_argument("--target", required=True, help="Path to target config JSON")
-    parser.add_argument("--input", required=True, help="Path to extracted jobs.json")
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",  # Makes it a flag, True if present
-        help="Perform parsing and build job objects, but do not submit to Azure ML.",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,  # Default is no limit
-        help="Limit the number of original execution units (pipelines/standalone jobs) to process for testing.",
-    )
-    args = parser.parse_args()
 
+
+def main(args):
     print("Loading job metadata...")
     try:
         with open(args.input, "r", encoding="utf-8") as f:
@@ -562,3 +544,25 @@ if __name__ == "__main__":
     else:
         print(" (No jobs submitted or processed)")
     print("----------------------")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Build and submit replay jobs/pipelines"
+    )
+    parser.add_argument("--target", required=True, help="Path to target config JSON")
+    parser.add_argument("--input", required=True, help="Path to extracted jobs.json")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",  # Makes it a flag, True if present
+        help="Perform parsing and build job objects, but do not submit to Azure ML.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,  # Default is no limit
+        help="Limit the number of original execution units (pipelines/standalone jobs) to process for testing.",
+    )
+    args = parser.parse_args()
+
+    main(args)

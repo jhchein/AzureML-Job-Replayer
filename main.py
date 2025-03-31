@@ -91,13 +91,15 @@ def main():
         print("To replay these jobs, run without --dry-run flag")
     else:
         print("\n--- REPLAY PHASE ---")
-        replay_args = ["--target", args.target, "--input", args.output]
-        if args.limit:
-            replay_args.extend(["--limit", str(args.limit)])
+        # Create a proper Namespace object instead of a list
+        replay_args = argparse.Namespace()
+        replay_args.target = args.target
+        replay_args.input = args.output
+        replay_args.limit = args.limit
+        replay_args.dry_run = args.dry_run
 
-        # Call replay logic
+        # Call replay logic with proper arguments
         try:
-            # Convert the args to the format expected by replay_main
             replay_main(replay_args)
         except Exception as e:
             logger.exception(f"Replay failed: {e}")
