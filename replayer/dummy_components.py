@@ -6,7 +6,7 @@ from azure.ai.ml.entities import Environment
 # Assuming conda.yaml is correctly located relative to the project root
 # when running with 'python -m'
 DUMMY_ENV_NAME = "dummy-env"
-DUMMY_ENV_VERSION = "1"
+DUMMY_ENV_VERSION = "1.1.0"
 DUMMY_ENV_CONDA_PATH = "replayer/conda.yaml"  # Path relative to project root
 
 DUMMY_ENV = Environment(
