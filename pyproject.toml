@@ -1,0 +1,14 @@
+[project]
+name = "azureml-job-replayer"
+version = "1.0.1"
+description = "This tool helps you **recreate AzureML jobs from one workspace in another** without rerunning the full pipeline logic"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "azure-ai-ml>=1.26.0",
+    "azure-identity>=1.21.0",
+    "azureml-mlflow>=1.59.0.post1",
+    "mlflow>=2.21.2",
+    "python-dateutil>=2.9.0.post0",
+    "tdqm>=0.0.1",
+]
