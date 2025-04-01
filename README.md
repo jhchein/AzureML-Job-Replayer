@@ -17,30 +17,6 @@ This tool helps you **recreate AzureML jobs from one workspace in another** with
 
 ---
 
-## 📚 Table of Contents
-
-- [AzureML Job Replayer](#azureml-job-replayer)
-  - [🔍 Overview](#-overview)
-  - [📚 Table of Contents](#-table-of-contents)
-  - [🔄 Use Case](#-use-case)
-  - [🚀 Features](#-features)
-  - [⚙️ Prerequisites](#️-prerequisites)
-  - [🔧 Configuration](#-configuration)
-  - [🎯 Usage](#-usage)
-    - [1️⃣ **Run the Full Workflow with `main.py`**](#1️⃣-run-the-full-workflow-with-mainpy)
-    - [2️⃣ **Run Individual Phases**](#2️⃣-run-individual-phases)
-      - [📥 Extraction Phase](#-extraction-phase)
-      - [🔄 Replay Phase](#-replay-phase)
-    - [🚩 Quickstart Example](#-quickstart-example)
-  - [📈 Example Output](#-example-output)
-  - [🛠️ Troubleshooting](#️-troubleshooting)
-  - [🗺️ Roadmap](#️-roadmap)
-  - [🎓 License \& Contributions](#-license--contributions)
-  - [🤝 Contributing](#-contributing)
-  - [❓ Getting Help](#-getting-help)
-
----
-
 ## 🔄 Use Case
 
 You may want to:
@@ -68,9 +44,9 @@ You may want to:
 Install dependencies:
 
 ```bash
-uv install
-# or
 pip install -r requirements.txt
+# or
+uv install
 ```
 
 ---
