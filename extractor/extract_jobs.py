@@ -627,7 +627,9 @@ def _process_job_object(job: Job, mlflow_client: MlflowClient) -> Optional[JobMe
     return jm
 
 
-def extract_all_jobs(client: MLClient) -> Iterator[JobMetadata]:
+def extract_all_jobs(
+    client: MLClient, limit: Optional[int] = None
+) -> Iterator[JobMetadata]:
     """
     Extract all top-level jobs AND their child jobs (for pipelines)
     from the AzureML workspace and yield them one by one.
@@ -647,12 +649,22 @@ def extract_all_jobs(client: MLClient) -> Iterator[JobMetadata]:
         logger.exception(f"Failed to list initial job summaries: {e}")
         return
 
-    print(
-        f"Found {len(all_job_summaries)} total top-level job summaries. Starting extraction including children..."
-    )
+    # Apply limit to job summaries before creating the progress bar
+    total_jobs = len(all_job_summaries)
+    if limit is not None and limit < total_jobs:
+        print(
+            f"Found {total_jobs} total top-level job summaries. Limiting to {limit} as requested."
+        )
+        job_summaries_to_process = all_job_summaries[:limit]
+    else:
+        print(
+            f"Found {total_jobs} total top-level job summaries. Starting extraction including children..."
+        )
+        job_summaries_to_process = all_job_summaries
 
+    # Now use the limited list for tqdm
     for job_summary in tqdm(
-        all_job_summaries, desc="Processing Top-Level Jobs", unit="job"
+        job_summaries_to_process, desc="Processing Top-Level Jobs", unit="job"
     ):
         parent_job_name = job_summary.name
 
@@ -729,8 +741,7 @@ def extract_all_jobs(client: MLClient) -> Iterator[JobMetadata]:
 # --- Main Execution ---
 
 
-def main(source_config: str, output_path: str):
-    # ... (logging setup, client connection, output dir creation as before) ...
+def main(source_config: str, output_path: str, limit: Optional[int] = None):
     setup_logging()
 
     try:
@@ -746,7 +757,6 @@ def main(source_config: str, output_path: str):
     if output_dir:
         try:
             os.makedirs(output_dir, exist_ok=True)
-            print(f"Output directory ensured: {output_dir}")
         except OSError as e:
             logger.error(f"Failed to create output directory {output_dir}: {e}")
             return
@@ -755,40 +765,16 @@ def main(source_config: str, output_path: str):
     first_item = True
     try:
         with open(output_path, "w", encoding="utf-8") as f:
-            f.write("[\n")
+            f.write("[")  # Start JSON array
+            for job_metadata in extract_all_jobs(source_client, limit=limit):
+                if not first_item:
+                    f.write(",\n")
+                else:
+                    first_item = False
+                f.write(json.dumps(job_metadata.to_dict(), indent=2))
+                job_count += 1
+            f.write("]")  # End JSON array
 
-            # The iterator now yields parents AND children sequentially
-            for job_metadata in extract_all_jobs(source_client):
-                try:
-                    job_dict = job_metadata.to_dict()
-                    job_json = json.dumps(job_dict, indent=2, ensure_ascii=False)
-
-                    if not first_item:
-                        f.write(",\n")
-                    else:
-                        first_item = False
-
-                    f.write(job_json)
-                    job_count += 1  # Count total jobs written (parents + children)
-
-                except TypeError as e:
-                    logger.error(
-                        f"Serialization Error for job {job_metadata.name}: {e}. Skipping this job."
-                    )
-                    logger.debug(
-                        f"Problematic JobMetadata causing TypeError: {job_metadata!r}"
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"Unexpected error processing/writing job {job_metadata.name}: {e}. Skipping this job."
-                    )
-                    logger.debug(
-                        f"Problematic JobMetadata causing Exception: {job_metadata!r}"
-                    )
-
-            f.write("\n]")
-
-        # Update final message to reflect total jobs found
         print(
             f"\nSuccessfully extracted {job_count} total jobs (including pipeline children) to {output_path}"
         )
@@ -807,5 +793,11 @@ if __name__ == "__main__":
         "--source", required=True, help="Path to source workspace config JSON"
     )
     parser.add_argument("--output", required=True, help="Path to output JSON file")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Optional limit on the number of jobs to extract",
+    )
     args = parser.parse_args()
-    main(args.source, args.output)
+    main(args.source, args.output, args.limit)

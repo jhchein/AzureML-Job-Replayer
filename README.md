@@ -79,8 +79,8 @@ python main.py --source config/source_config.json --target config/target_config.
 
 Options:
 
-- `--dry-run`: Validate extraction and replay without submitting jobs to the target workspace (currently only implemented for replay)
-- `--limit`: Limit the number of jobs to process (useful for testing, currently only implemented for replay)
+- `--dry-run`: Validate extraction and replay without submitting jobs to the target workspace
+- `--limit`: Limit the number of jobs to process (useful for testing)
 - `--output`: Specify the path to save extracted job metadata (default: `data/jobs.json`)
 - ~~`--filter`: Filter jobs by status or name pattern (not implemented)~~
 
@@ -90,7 +90,7 @@ Example:
 python main.py --source config/source_config.json --target config/target_config.json --limit 1 --dry-run
 ```
 
-This will extract ~~one~~ all jobs from the source workspace and simulate the replay for one job in the target workspace without submitting it.
+This will extract one job from the source workspace and simulate the replay for one job in the target workspace without submitting it.
 
 ---
 
@@ -147,50 +147,65 @@ Or run the phases individually:
 
 ## 📈 Example Output
 
+> Note: The job and pipeline in and outputs and therefore connections / edges between the nodes are not (yet) maintained.
+
 ![Job Details](/assets/docs/job_details.png)
 ![Pipeline Details](/assets/docs/pipelines.png)
-
-> Note: The job and pipeline in and outputs and therefore connections / edges between the nodes are not (yet) maintained.
 
 ```text
 (azureml-job-replayer) PS C:\code\AzureML-Job-Replayer> uv run .\main.py
 Logging configured. Console level >= WARNING
-Detailed logs (Level >= DEBUG) in: logs\replayer_20250401_084651.log
+Detailed logs (Level >= DEBUG) in: logs\replayer_20250401_112522.log
 🔍 Source: source-dummy-workspace
 🎯 Target: target-dummy-workspace
 
 --- EXTRACTION PHASE ---
-Detailed logs will be written to: logs\extract_jobs_20250401_084653.log
+Detailed logs will be written to: logs\extract_jobs_20250401_112522.log
 Connected to workspace: source-dummy-workspace
-Output directory ensured: data
-Found 42 total top-level job summaries. Starting extraction including children...
-Processing Top-Level Jobs:   ██████████████▏     | 26/42 [04:56<01:56,  7.26s/job]
-```
+Found 42 total top-level job summaries. Limiting to 2 as requested.
+Processing Top-Level Jobs: 100%|███████████████████████████████████████████████| 2/2 [00:33<00:00, 16.98s/job]
 
-```text
+Successfully extracted 4 total jobs (including pipeline children) to data/jobs.json
+
 --- REPLAY PHASE ---
 Loading job metadata...
-Loaded 69 job metadata records.
-Grouped into 42 original execution units (pipelines/standalone jobs).
+Loaded 4 job metadata records.
+Grouped into 2 original execution units (pipelines/standalone jobs).
 Connected to target workspace: target-dummy-workspace
 Ensuring dummy environment 'dummy-env:1.1.0' exists...
  -> Environment 'dummy-env:1.1.0' is ready.
 
-Processing original unit 1/42: labeling_Inference_7b9f679c_1698238717415 (1 records)
+Processing original unit 1/2: labeling_Inference_7b9f679c_1698238717415 (1 records)
  -> Identified as Standalone Job: labeling_Inference_7b9f679c_1698238717415
    Submitting replay job/pipeline...
-Uploading tmp4b27oeeg.json (< 1 MB): 100%|##############################################################################################################################################################################| 96.0/96.0 [00:00<00:00, 2.51kB/s]
+Uploading tmpxsog0z4x.json (< 1 MB): 100%|##########################################################################| 96.0/96.0 [00:00<00:00, 1.69kB/s]
 
 
-   ✔ Submitted: loving_kitten_kf60qy8510 (Type: command) for original: labeling_Inference_7b9f679c_1698238717415
+   ✔ Submitted: good_soca_c4pwx5s48k (Type: command) for original: labeling_Inference_7b9f679c_1698238717415
 
-Processing original unit 2/42: 607d6225-20a0-4f26-a160-b6fd6bbe6ee0 (3 records)
+Processing original unit 2/2: 607d6225-20a0-4f26-a160-b6fd6bbe6ee0 (3 records)
  -> Identified as Pipeline Job: 607d6225-20a0-4f26-a160-b6fd6bbe6ee0 (2 children)
    Submitting replay job/pipeline...
-Uploading metrics_99ebd998-e587-46aa-b317-ca3e2ac9e052.json (< 1 MB): 100%|##############################################################################################################################################| 2.00/2.00 [00:00<00:00, 46.8B/s]
+Uploading metrics_66aefbd1-ca5d-4de7-9562-17f89a7e839e.json (< 1 MB): 100%|##########################################################################| 2.00/2.00 [00:00<00:00, 33.2B/s]
 
 
-Uploading metrics_096d7bea-a720-421e-89cf-6c4d2f579074.json (< 1 MB): 100%|##############################################################################################################################################| 2.00/2.00 [00:00<00:00, 41.9B/s]
+Uploading metrics_bb493013-cd0c-480b-a994-6d77811d3438.json (< 1 MB): 100%|##########################################################################| 2.00/2.00 [00:00<00:00, 33.6B/s]
+
+
+   ✔ Submitted: gifted_guava_kczbhpxx6x (Type: pipeline) for original: 607d6225-20a0-4f26-a160-b6fd6bbe6ee0
+
+--- Replay Summary ---
+Total original units found: 2
+Units processed (due to limit or completion): 2
+Successfully submitted replay jobs/pipelines: 2
+Failed submissions or builds: 0
+Skipped due to structure issues: 0
+Original ID -> Replay Job Name/Status Mapping:
+ - labeling_Inference_7b9f679c_1698238717415 -> good_soca_c4pwx5s48k
+ - 607d6225-20a0-4f26-a160-b6fd6bbe6ee0 -> gifted_guava_kczbhpxx6x
+----------------------
+
+✅ AzureML Job Replayer completed successfully
 ```
 
 ---

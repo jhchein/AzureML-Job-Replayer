@@ -78,7 +78,8 @@ def main():
     print("\n--- EXTRACTION PHASE ---")
     # Call extraction logic, passing the source config and output path
     try:
-        extract_main(args.source, args.output)
+        # Update to pass the limit to extract_main
+        extract_main(args.source, args.output, args.limit)
     except Exception as e:
         logger.exception(f"Extraction failed: {e}")
         print(f"❌ Error during extraction: {e}")
