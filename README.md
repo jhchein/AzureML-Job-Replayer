@@ -79,10 +79,10 @@ python main.py --source config/source_config.json --target config/target_config.
 
 Options:
 
-- `--filter`: Filter jobs by status or name pattern
-- `--dry-run`: Validate extraction and replay without submitting jobs to the target workspace
-- `--limit`: Limit the number of jobs to process (useful for testing)
+- `--dry-run`: Validate extraction and replay without submitting jobs to the target workspace (currently only implemented for replay)
+- `--limit`: Limit the number of jobs to process (useful for testing, currently only implemented for replay)
 - `--output`: Specify the path to save extracted job metadata (default: `data/jobs.json`)
+- ~~`--filter`: Filter jobs by status or name pattern (not implemented)~~
 
 Example:
 
@@ -90,7 +90,7 @@ Example:
 python main.py --source config/source_config.json --target config/target_config.json --limit 1 --dry-run
 ```
 
-This will extract one job from the source workspace and simulate the replay in the target workspace without submitting it.
+This will extract ~~one~~ all jobs from the source workspace and simulate the replay for one job in the target workspace without submitting it.
 
 ---
 
