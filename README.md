@@ -144,6 +144,10 @@ Or run the phases individually:
 
 ## 📈 Example Output
 
+![All Jobs Overview](/assets/docs/all_jobs.png)
+![All Jobs Overview](/assets/docs/job_details.png)
+![All Jobs Overview](/assets/docs/pipelines.png)
+
 ```text
 --- EXTRACTION PHASE ---
 ✅ Extracted 15 jobs (3 pipelines + 12 child steps) from source workspace.
