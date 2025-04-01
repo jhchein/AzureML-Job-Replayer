@@ -1,5 +1,9 @@
 # AzureML Job Replayer
 
+![Python](https://img.shields.io/badge/python-3.9%2B-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+![Dependencies](https://img.shields.io/badge/dependencies-up%20to%20date-brightgreen)
+
 ## 🔍 Overview
 
 This tool helps you **recreate AzureML jobs from one workspace in another** without rerunning the full pipeline logic. It's designed to:
@@ -10,6 +14,30 @@ This tool helps you **recreate AzureML jobs from one workspace in another** with
 - Enable **migration**, **auditing**, or **archiving** of AzureML jobs across workspaces
 
 ![All Jobs Overview](/assets/docs/all_jobs.png)
+
+---
+
+## 📚 Table of Contents
+
+- [AzureML Job Replayer](#azureml-job-replayer)
+  - [🔍 Overview](#-overview)
+  - [📚 Table of Contents](#-table-of-contents)
+  - [🔄 Use Case](#-use-case)
+  - [🚀 Features](#-features)
+  - [⚙️ Prerequisites](#️-prerequisites)
+  - [🔧 Configuration](#-configuration)
+  - [🎯 Usage](#-usage)
+    - [1️⃣ **Run the Full Workflow with `main.py`**](#1️⃣-run-the-full-workflow-with-mainpy)
+    - [2️⃣ **Run Individual Phases**](#2️⃣-run-individual-phases)
+      - [📥 Extraction Phase](#-extraction-phase)
+      - [🔄 Replay Phase](#-replay-phase)
+    - [🚩 Quickstart Example](#-quickstart-example)
+  - [📈 Example Output](#-example-output)
+  - [🛠️ Troubleshooting](#️-troubleshooting)
+  - [🗺️ Roadmap](#️-roadmap)
+  - [🎓 License \& Contributions](#-license--contributions)
+  - [🤝 Contributing](#-contributing)
+  - [❓ Getting Help](#-getting-help)
 
 ---
 
@@ -25,11 +53,9 @@ You may want to:
 
 ## 🚀 Features
 
-- Recreates pipeline structure in target workspace
-- Dummy component steps emit original metrics using `mlflow`
-- Metadata and relationships preserved via tags
-- Supports both standalone and pipeline jobs
-- Dry-run mode for validation without submission
+- ✅ Supports both standalone and pipeline jobs
+- ✅ Preserves metadata and relationships
+- ✅ Dry-run mode for safe validation
 
 ---
 
@@ -37,7 +63,7 @@ You may want to:
 
 - Python 3.9+
 - Azure CLI logged in (`az login`)
-- `uv` for dependency management (optional)
+- `uv`: A dependency management tool for Python (optional).
 
 Install dependencies:
 
@@ -145,8 +171,8 @@ Or run the phases individually:
 
 ## 📈 Example Output
 
-![All Jobs Overview](/assets/docs/job_details.png)
-![All Jobs Overview](/assets/docs/pipelines.png)
+![Job Details](/assets/docs/job_details.png)
+![Pipeline Details](/assets/docs/pipelines.png)
 
 > Note: The job and pipeline in and outputs and therefore connections / edges between the nodes are not (yet) maintained.
 
@@ -193,9 +219,19 @@ Uploading metrics_096d7bea-a720-421e-89cf-6c4d2f579074.json (< 1 MB): 100%|#####
 
 ---
 
+## 🛠️ Troubleshooting
+
+- **Issue:** `ModuleNotFoundError: No module named 'azureml'`  
+  **Solution:** Ensure dependencies are installed using `uv install` or `pip install -r requirements.txt`.
+
+- **Issue:** `Authentication failed`  
+  **Solution:** Make sure you are logged into Azure CLI using `az login` and have write permissions and access (network) to the target workspace storage account.
+
+---
+
 ## 🗺️ Roadmap
 
-- [ ] Support artifact copy
+- [ ] Support artifact copy (e.g. retain model artifacts or job outputs)
 - [ ] Support output logs copy
 - [ ] CLI flags for selective job subset
 - [ ] Support job filtering by tags/date ranges
@@ -210,11 +246,21 @@ MIT License. Feel free to fork and adapt. Contributions welcome!
 
 ## 🤝 Contributing
 
+1. Fork the repository.
+2. Clone your fork: `git clone https://github.com/your-username/azureml-job-replayer.git`
+3. Create a new branch: `git checkout -b feature-name`
+4. Make your changes and commit them: `git commit -m "Add feature-name"`
+5. Push to your fork: `git push origin feature-name`
+6. Open a pull request.
+
 Feel free to open issues or PRs. For major changes, please open an issue first to discuss.
 
 ---
 
-## ❓ Questions?
+## ❓ Getting Help
+
+- [AzureML Documentation](https://learn.microsoft.com/en-us/azure/machine-learning/)
+- Open an issue in this repository
 
 Reach out to the author or open an issue.
 *Built with ❤️ by Hendrik in VS Code.*
