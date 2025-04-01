@@ -4,10 +4,12 @@
 
 This tool helps you **recreate AzureML jobs from one workspace in another** without rerunning the full pipeline logic. It's designed to:
 
-- Preserve **pipeline structure** (parent-child job relationships)
+- Preserve overall **pipeline structure** (parent-child job relationships)
 - Replay **metrics**, **tags**, and **metadata**
 - Minimize compute usage via lightweight dummy steps
 - Enable **migration**, **auditing**, or **archiving** of AzureML jobs across workspaces
+
+![All Jobs Overview](/assets/docs/all_jobs.png)
 
 ---
 
@@ -15,10 +17,9 @@ This tool helps you **recreate AzureML jobs from one workspace in another** with
 
 You may want to:
 
-- Migrate jobs from dev/test to prod workspaces
+- Migrate job metrics to new workspaces
 - Reconstruct job lineage from a deprecated workspace
-- Retain structure and results without re-running expensive training
-- Create a consistent audit trail across tenants
+- Create consistent job tracking within AzureML across tenants and workspaces
 
 ---
 
@@ -144,20 +145,50 @@ Or run the phases individually:
 
 ## 📈 Example Output
 
-![All Jobs Overview](/assets/docs/all_jobs.png)
 ![All Jobs Overview](/assets/docs/job_details.png)
 ![All Jobs Overview](/assets/docs/pipelines.png)
 
-```text
---- EXTRACTION PHASE ---
-✅ Extracted 15 jobs (3 pipelines + 12 child steps) from source workspace.
-✅ Job metadata saved to data/jobs.json
+> Note: The job and pipeline in and outputs and therefore connections / edges between the nodes are not (yet) maintained.
 
+```text
+(azureml-job-replayer) PS C:\code\AzureML-Job-Replayer> uv run .\main.py
+Logging configured. Console level >= WARNING
+Detailed logs (Level >= DEBUG) in: logs\replayer_20250401_084651.log
+🔍 Source: source-dummy-workspace
+🎯 Target: target-dummy-workspace
+
+--- EXTRACTION PHASE ---
+Detailed logs will be written to: logs\extract_jobs_20250401_084653.log
+Connected to workspace: source-dummy-workspace
+Output directory ensured: data
+Found 42 total top-level job summaries. Starting extraction including children...
+Processing Top-Level Jobs:   ██████████████▏     | 26/42 [04:56<01:56,  7.26s/job]
+```
+
+```text
 --- REPLAY PHASE ---
-✅ Submitted 3 replay pipelines in target workspace.
-Mapping:
- - original: job-abc123 → replay: job-def456
- - original: job-xyz789 → replay: job-ghi012
+Loading job metadata...
+Loaded 69 job metadata records.
+Grouped into 42 original execution units (pipelines/standalone jobs).
+Connected to target workspace: target-dummy-workspace
+Ensuring dummy environment 'dummy-env:1.1.0' exists...
+ -> Environment 'dummy-env:1.1.0' is ready.
+
+Processing original unit 1/42: labeling_Inference_7b9f679c_1698238717415 (1 records)
+ -> Identified as Standalone Job: labeling_Inference_7b9f679c_1698238717415
+   Submitting replay job/pipeline...
+Uploading tmp4b27oeeg.json (< 1 MB): 100%|##############################################################################################################################################################################| 96.0/96.0 [00:00<00:00, 2.51kB/s]
+
+
+   ✔ Submitted: loving_kitten_kf60qy8510 (Type: command) for original: labeling_Inference_7b9f679c_1698238717415
+
+Processing original unit 2/42: 607d6225-20a0-4f26-a160-b6fd6bbe6ee0 (3 records)
+ -> Identified as Pipeline Job: 607d6225-20a0-4f26-a160-b6fd6bbe6ee0 (2 children)
+   Submitting replay job/pipeline...
+Uploading metrics_99ebd998-e587-46aa-b317-ca3e2ac9e052.json (< 1 MB): 100%|##############################################################################################################################################| 2.00/2.00 [00:00<00:00, 46.8B/s]
+
+
+Uploading metrics_096d7bea-a720-421e-89cf-6c4d2f579074.json (< 1 MB): 100%|##############################################################################################################################################| 2.00/2.00 [00:00<00:00, 41.9B/s]
 ```
 
 ---
