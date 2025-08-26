@@ -5,18 +5,13 @@ import os
 import shutil
 import tempfile
 import uuid
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 
 from azure.ai.ml import (
     Input,
 )
 from azure.ai.ml.constants import AssetTypes
-from azure.ai.ml.entities import (
-    CommandJob,
-    PipelineJob,
-    PipelineJobSettings,
-    UserIdentityConfiguration,
-)
+from azure.ai.ml.entities import PipelineJob, PipelineJobSettings, UserIdentityConfiguration
 from azure.core.exceptions import HttpResponseError
 
 from extractor.extract_jobs import JobMetadata
@@ -46,48 +41,51 @@ REPLAY_TYPE_TAG = "replay_type"
 DUMMY_REPLAY_VALUE = "dummy_metrics_replay"
 
 
-def get_parent_and_children(
-    jobs_in_group: List[JobMetadata],
-) -> Tuple[Optional[JobMetadata], List[JobMetadata]]:
-    """Separates the parent job from child jobs in a list."""
-    parent = None
-    children = []
-    parent_job_name = jobs_in_group[
-        0
-    ].parent_job_name  # Assume first one tells us if it's a child group
+def _index_jobs(jobs: List[JobMetadata]):
+    """Build indexes for replay construction.
 
-    if (
-        parent_job_name is None
-    ):  # This group represents a standalone job OR a parent itself
-        if len(jobs_in_group) == 1:  # Likely standalone
-            return jobs_in_group[0], []
-        else:  # It's a group containing the parent AND children, find the parent
-            potential_parent_name = jobs_in_group[
-                0
-            ].name  # Key used for grouping was parent name
-            for job in jobs_in_group:
-                if job.name == potential_parent_name and job.parent_job_name is None:
-                    parent = job
-                else:
-                    children.append(job)
-            if parent:
-                return parent, children
-            else:
-                # Should not happen with current grouping, but handle defensively
-                print(
-                    f"Warning: Could not definitively identify parent in group for key {potential_parent_name}. Treating all as children."
-                )
-                return None, jobs_in_group
-    else:  # This group contains only children of a parent processed elsewhere
-        # Or the grouping logic needs refinement if parents are included here too.
-        # Assuming the grouping key ensures this list is *only* children or *only* standalone.
-        # If the key is parent_job_name, this list *should* be only children.
-        # Let's refine the grouping logic later if needed.
-        # For now, assume this case doesn't happen if grouping is correct.
-        print(
-            f"Warning: Unexpected grouping for key {parent_job_name}. Expected standalone or parent+children."
-        )
-        return None, jobs_in_group  # Treat as children?
+    Returns:
+        jobs_by_name: name -> metadata
+        children_map: parent_name -> list[child metadata]
+        pipeline_names: set of names where job_type == 'pipeline'
+    """
+    jobs_by_name: Dict[str, JobMetadata] = {}
+    children_map: Dict[str, List[JobMetadata]] = {}
+    pipeline_names: Set[str] = set()
+
+    for jm in jobs:
+        jobs_by_name[jm.name] = jm
+        if jm.job_type and jm.job_type.lower() == "pipeline":
+            pipeline_names.add(jm.name)
+
+    for jm in jobs:
+        if jm.parent_job_name and jm.parent_job_name in jobs_by_name:
+            children_map.setdefault(jm.parent_job_name, []).append(jm)
+
+    return jobs_by_name, children_map, pipeline_names
+
+
+def _compute_depths(jobs_by_name: Dict[str, JobMetadata]) -> Dict[str, int]:
+    """Compute depth (0-based) for each job based on parent chain."""
+    depth_cache: Dict[str, int] = {}
+
+    def depth(name: str, seen: Set[str]) -> int:
+        if name in depth_cache:
+            return depth_cache[name]
+        jm = jobs_by_name.get(name)
+        if not jm or not jm.parent_job_name:
+            depth_cache[name] = 0
+            return 0
+        if jm.parent_job_name in seen:  # cycle guard
+            depth_cache[name] = 0
+            return 0
+        d = 1 + depth(jm.parent_job_name, seen | {jm.parent_job_name})
+        depth_cache[name] = d
+        return d
+
+    for n in jobs_by_name:
+        depth(n, {n})
+    return depth_cache
 
 
 def build_dummy_pipeline_for_children(
@@ -171,13 +169,13 @@ def build_dummy_pipeline_for_children(
 def build_dummy_standalone_job(
     original_job: JobMetadata,
     metrics_file_path: str,
-) -> CommandJob:
+):
     """
     Builds a dummy CommandJob using a pre-existing metrics file path.
     """
     # Metrics file is already created by the caller
 
-    job: CommandJob = replay_metrics_component(
+    job = replay_metrics_component(
         original_job_id=original_job.name,
         metrics_file=Input(type=AssetTypes.URI_FILE, path=metrics_file_path),
     )
@@ -213,14 +211,27 @@ def main(args):
         # Optional: Log exception details if logging is configured
         exit(1)
 
-    # Group jobs by ORIGINAL parent_job_name (or own name if no parent)
-    original_execution_units: Dict[str, List[JobMetadata]] = {}
-    for job in all_jobs_metadata:
-        grouping_key = job.parent_job_name if job.parent_job_name else job.name
-        original_execution_units.setdefault(grouping_key, []).append(job)
+    # --- Build indexes for nested pipeline aware replay ---
+    jobs_by_name, children_map, pipeline_names = _index_jobs(all_jobs_metadata)
+    depths = _compute_depths(jobs_by_name)
+
+    # Define replay "units": each pipeline job (even if nested) + each standalone root command job
+    standalone_root_names = [
+        jm.name
+        for jm in all_jobs_metadata
+        if jm.name not in pipeline_names and not jm.parent_job_name
+    ]
+    # Order units by depth then name for deterministic processing (roots first)
+    pipeline_unit_names = sorted(pipeline_names, key=lambda n: (depths.get(n, 0), n))
+    standalone_root_names = sorted(
+        standalone_root_names, key=lambda n: (depths.get(n, 0), n)
+    )
+    replay_units: List[Tuple[str, str]] = [
+        ("pipeline", n) for n in pipeline_unit_names
+    ] + [("standalone", n) for n in standalone_root_names]
 
     print(
-        f"Grouped into {len(original_execution_units)} original execution units (pipelines/standalone jobs)."
+        f"Prepared {len(replay_units)} replay units: {len(pipeline_unit_names)} pipeline(s) + {len(standalone_root_names)} standalone root job(s)."
     )
 
     # --- Connect to Client and Register Environment ---
@@ -260,53 +271,36 @@ def main(args):
     failed_count = 0
     skipped_count = 0
     processed_count = 0
-    job_map = {}  # original_id -> new_job_name
+    job_map = {}  # original_id -> new_job_name / description
 
     # Ensure environment ID was set (should be unless dry run skipped it, which is ok for dry run)
     if not registered_env_id_for_jobs and not args.dry_run:
         print("Error: Environment ID was not set after registration attempt. Exiting.")
         exit(1)
 
-    for grouping_key, jobs_in_group in original_execution_units.items():
+    total_units = len(replay_units)
+
+    for unit_type, job_name in replay_units:
         if args.limit is not None and processed_count >= args.limit:
             print(f"\nReached processing limit ({args.limit}). Stopping.")
             break
         processed_count += 1
+
+        jm = jobs_by_name[job_name]
         print(
-            f"\nProcessing original unit {processed_count}/{len(original_execution_units) if args.limit is None else args.limit}: {grouping_key} ({len(jobs_in_group)} records)"
+            f"\nProcessing replay unit {processed_count}/{total_units if args.limit is None else min(total_units, args.limit)}: {job_name} (type={unit_type}, depth={depths.get(job_name, 0)})"
         )
 
-        is_standalone = (
-            all(j.parent_job_name is None for j in jobs_in_group)
-            and len(jobs_in_group) == 1
-        )
-        is_pipeline_group = any(
-            j.parent_job_name == grouping_key
-            for j in jobs_in_group
-            if j.parent_job_name is not None
-        ) or (
-            len(jobs_in_group) > 1
-            and any(
-                j.name == grouping_key and j.parent_job_name is None
-                for j in jobs_in_group
-            )
-        )
-
-        job_to_submit: Optional[CommandJob | PipelineJob] = None
-        original_identifier = grouping_key
-        temp_metrics_filepath_standalone = None  # For standalone file path
-        temp_pipeline_dir_path = None  # For pipeline
+        job_to_submit: Optional[object] = None  # PipelineJob or CommandJob-like object
+        original_identifier = job_name
+        temp_metrics_filepath_standalone = None
+        temp_pipeline_dir_path = None
 
         try:
             try:
-                if is_standalone:
-                    original_job_metadata = jobs_in_group[0]
-                    original_identifier = original_job_metadata.name
-                    print(
-                        f" -> Identified as Standalone Job: {original_job_metadata.name}"
-                    )
-
-                    # --- Create temp file BEFORE build ---
+                if unit_type == "standalone":
+                    original_job_metadata = jm
+                    print(f" -> Standalone root job: {original_job_metadata.name}")
                     metrics_to_log = original_job_metadata.mlflow_metrics or {}
                     metrics_json_str = json.dumps(metrics_to_log)
                     try:
@@ -318,42 +312,31 @@ def main(args):
                     except IOError as e:
                         raise IOError(
                             f"Failed to write temp metrics file for standalone job {original_identifier}: {e}"
-                        )  # Re-raise
-
-                    # --- Pass file path to build function ---
+                        )
                     job_to_submit = build_dummy_standalone_job(
                         original_job_metadata, temp_metrics_filepath_standalone
                     )
-
-                elif is_pipeline_group:
-                    parent_meta, children_meta = get_parent_and_children(jobs_in_group)
-                    if parent_meta and children_meta:
-                        original_identifier = parent_meta.name
+                elif unit_type == "pipeline":
+                    parent_meta = jm
+                    children_meta = children_map.get(parent_meta.name, [])
+                    if children_meta:
                         print(
-                            f" -> Identified as Pipeline Job: {original_identifier} ({len(children_meta)} children)"
+                            f" -> Pipeline job with {len(children_meta)} direct child job(s)."
                         )
-
-                        # --- Create persistent temp directory BEFORE build ---
                         try:
                             temp_pipeline_dir_path = tempfile.mkdtemp()
-                            # logger.debug(f"Pipeline {original_identifier}: Created temp directory: {temp_pipeline_dir_path}")
                         except OSError as e:
                             raise OSError(
                                 f"Failed to create temp directory for pipeline {original_identifier}: {e}"
-                            )  # Re-raise
-
-                        # --- Pass directory path to builder ---
+                            )
                         job_to_submit = build_dummy_pipeline_for_children(
-                            parent_meta,
-                            children_meta,
-                            temp_pipeline_dir_path,  # Pass dir path
+                            parent_meta, children_meta, temp_pipeline_dir_path
                         )
-                    elif parent_meta and not children_meta:
-                        # Treat as standalone (uses temp file, not dir)
-                        original_identifier = parent_meta.name
-                        print(
-                            f" -> Identified as Pipeline Job with NO children: {original_identifier}. Replaying as standalone."
-                        )
+                        if job_to_submit is None:
+                            print(
+                                " -> No steps generated (possibly no metrics). Falling back to standalone replay for pipeline parent."
+                            )
+                    if not children_meta or job_to_submit is None:
                         metrics_to_log = parent_meta.mlflow_metrics or {}
                         metrics_json_str = json.dumps(metrics_to_log)
                         try:
@@ -362,7 +345,6 @@ def main(args):
                             ) as temp_f:
                                 temp_metrics_filepath_standalone = temp_f.name
                                 temp_f.write(metrics_json_str)
-                            # logger.debug(f"Standalone Pipeline {original_identifier}: Created temp metrics file: {temp_metrics_filepath_standalone}")
                         except IOError as e:
                             raise IOError(
                                 f"Failed to write temp metrics file for pipeline-as-standalone job {original_identifier}: {e}"
@@ -370,16 +352,8 @@ def main(args):
                         job_to_submit = build_dummy_standalone_job(
                             parent_meta, temp_metrics_filepath_standalone
                         )
-                    else:
-                        print(
-                            f" -> Warning: Could not determine parent/child structure for pipeline group {grouping_key}. Skipping."
-                        )
-                        skipped_count += 1
-                        continue
                 else:
-                    print(
-                        f" -> Warning: Ambiguous structure or invalid group for key {grouping_key}. Skipping."
-                    )
+                    print(f" -> Unknown unit type '{unit_type}'. Skipping.")
                     skipped_count += 1
                     continue
 
@@ -407,7 +381,8 @@ def main(args):
                     print(f"  Tags: {job_to_submit.tags}")
                     # Add environment check for dry run
                     env_id = None
-                    if isinstance(job_to_submit, CommandJob):
+                    from azure.ai.ml.entities import CommandJob as _CommandJob
+                    if isinstance(job_to_submit, _CommandJob):
                         env_id = job_to_submit.environment
                     elif isinstance(job_to_submit, PipelineJob) and job_to_submit.jobs:
                         # Check env on first step as representative
@@ -427,7 +402,7 @@ def main(args):
                             print(
                                 f"    - Step: {step_name} (Display: {step_job.display_name}, Comp: {comp_name}, Compute: {step_job.compute}, Tags: {step_job.tags})"
                             )
-                    elif isinstance(job_to_submit, CommandJob):
+                    elif isinstance(job_to_submit, _CommandJob):
                         print(f"  Command: {job_to_submit.command}")
                         print(f"  Compute: {job_to_submit.compute}")
                     print("--- END DRY RUN ---")
@@ -527,7 +502,7 @@ def main(args):
 
     # --- Final Summary ---
     print("\n--- Replay Summary ---")
-    print(f"Total original units found: {len(original_execution_units)}")
+    print(f"Total replay units found: {total_units}")
     print(f"Units processed (due to limit or completion): {processed_count}")
     if args.dry_run:
         print(f"Successfully processed (Dry Run): {submitted_count}")

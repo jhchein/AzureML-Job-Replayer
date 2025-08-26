@@ -8,7 +8,7 @@
 
 This tool helps you **recreate AzureML jobs from one workspace in another** without rerunning the full pipeline logic. It's designed to:
 
-- Preserve overall **pipeline structure** (parent-child job relationships)
+- Preserve overall **pipeline structure** (parent–child job relationships, now with nested pipeline recursion)
 - Replay **metrics**, **tags**, and **metadata**
 - Minimize compute usage via lightweight dummy steps
 - Enable **migration**, **auditing**, or **archiving** of AzureML jobs across workspaces
@@ -24,14 +24,17 @@ You may want to:
 - Migrate job metrics to new workspaces
 - Reconstruct job lineage from a deprecated workspace
 - Create consistent job tracking within AzureML across tenants and workspaces
+- Export only a curated subset of historical jobs (NEW selective extraction)
 
 ---
 
 ## 🚀 Features
 
-- ✅ Supports both standalone and pipeline jobs
+- ✅ Supports standalone, pipeline, and nested (multi-level) pipeline jobs
 - ✅ Preserves metadata and relationships
+- ✅ Selective export via include list/file of top-level job names (NEW)
 - ✅ Dry-run mode for safe validation
+- ✅ Recursive traversal of all pipeline descendants
 
 ---
 
@@ -69,9 +72,7 @@ Create two workspace config JSONs under `config/`, by renaming `source_config.js
 
 You can run the tool in two ways:
 
-### 1️⃣ **Run the Full Workflow with `main.py`**
-
-The `main.py` script combines both the **Extraction** and **Replay** phases into a single command. This is the easiest way to use the tool:
+### 1️⃣ Full Workflow with `main.py`
 
 ```bash
 python main.py --source config/source_config.json --target config/target_config.json
@@ -80,9 +81,9 @@ python main.py --source config/source_config.json --target config/target_config.
 Options:
 
 - `--dry-run`: Validate extraction and replay without submitting jobs to the target workspace
-- `--limit`: Limit the number of jobs to process (useful for testing)
-- `--output`: Specify the path to save extracted job metadata (default: `data/jobs.json`)
-- ~~`--filter`: Filter jobs by status or name pattern (not implemented)~~
+- `--limit`: Limit the number of jobs to process (top-level units; useful for testing)
+- `--output`: Path for extracted job metadata (default: `data/jobs.json`)
+- (Selective include flags currently apply to the standalone extractor; you can still chain them: run extractor with include → replay file with `main.py --dry-run --input <file>` if/once supported.)
 
 Example:
 
@@ -90,25 +91,55 @@ Example:
 python main.py --source config/source_config.json --target config/target_config.json --limit 1 --dry-run
 ```
 
-This will extract one job from the source workspace and simulate the replay for one job in the target workspace without submitting it.
-
 ---
 
-### 2️⃣ **Run Individual Phases**
-
-If you prefer more control, you can run the **Extractor** and **Replayer** separately:
+### 2️⃣ Run Phases Individually
 
 #### 📥 Extraction Phase
 
-Extract jobs from the source workspace and save metadata:
+Extract jobs (all or a selected subset) from the source workspace:
 
 ```bash
 python -m extractor.extract_jobs --source config/source_config.json --output data/jobs.json
 ```
 
-#### 🔄 Replay Phase
+Selective export (NEW):
 
-Replay extracted jobs into the target workspace:
+| Option           | Description                                                                                          |
+| ---------------- | ---------------------------------------------------------------------------------------------------- |
+| `--include`      | Comma-separated list of exact top-level job names to include                                         |
+| `--include-file` | Path to a text file with one job name per line                                                       |
+| `--limit`        | Applied after include filtering; caps number of selected top-level roots                             |
+| (recursive)      | All descendants (children, grandchildren, etc.) of each included pipeline are automatically exported |
+
+Examples:
+
+Export only two specific jobs:
+
+```bash
+python -m extractor.extract_jobs --source config/source_config.json --output data/subset.json --include jobA,jobB
+```
+
+From a file:
+
+```bash
+python -m extractor.extract_jobs --source config/source_config.json --output data/subset.json --include-file job_names.txt
+```
+
+Combine file + limit (takes first 5 of those found):
+
+```bash
+python -m extractor.extract_jobs --source config/source_config.json --output data/subset5.json --include-file job_names.txt --limit 5
+```
+
+Notes:
+
+- Matching is case-sensitive (AzureML job names are case-sensitive).
+- Missing names are logged and skipped.
+- Descendant traversal is depth-first and de-duplicates by job name.
+- Non-pipeline jobs in the include list are exported as-is.
+
+#### 🔄 Replay Phase
 
 ```bash
 python -m replayer.build_pipeline --input data/jobs.json --target config/target_config.json
@@ -116,142 +147,183 @@ python -m replayer.build_pipeline --input data/jobs.json --target config/target_
 
 Options:
 
-- `--limit`: Limit the number of jobs to replay (useful for testing)
-- `--dry-run`: Validate replay without submitting jobs to the target workspace
+- `--limit`: Limit number of original execution units replayed (pipelines or standalone jobs)
+- `--dry-run`: Build locally without submitting
 
 ---
 
 ### 🚩 Quickstart Example
 
-Run the full workflow with `main.py`:
+Full workflow:
 
 ```bash
 python main.py --source config/source_config.json --target config/target_config.json
 ```
 
-Or run the phases individually:
+Selective subset then replay:
 
-1. Extract jobs:
-
-   ```bash
-   python -m extractor.extract_jobs --source config/source_config.json --output data/jobs.json
-   ```
-
-2. Replay jobs:
-
-   ```bash
-   python -m replayer.build_pipeline --input data/jobs.json --target config/target_config.json
-   ```
+```bash
+python -m extractor.extract_jobs --source config/source_config.json --output data/selected.json --include-file job_names.txt
+python -m replayer.build_pipeline --input data/selected.json --target config/target_config.json --dry-run
+```
 
 ---
 
 ## 📈 Example Output
 
-> Note: The job and pipeline in and outputs and therefore connections / edges between the nodes are not (yet) maintained.
+> Note: Pipeline input/output edge recreation is not yet implemented.
 
-![Job Details](/assets/docs/job_details.png)
-![Pipeline Details](/assets/docs/pipelines.png)
-
-```text
-(azureml-job-replayer) PS C:\code\AzureML-Job-Replayer> uv run .\main.py
-Logging configured. Console level >= WARNING
-Detailed logs (Level >= DEBUG) in: logs\replayer_20250401_112522.log
-🔍 Source: source-dummy-workspace
-🎯 Target: target-dummy-workspace
-
---- EXTRACTION PHASE ---
-Detailed logs will be written to: logs\extract_jobs_20250401_112522.log
-Connected to workspace: source-dummy-workspace
-Found 42 total top-level job summaries. Limiting to 2 as requested.
-Processing Top-Level Jobs: 100%|███████████████████████████████████████████████| 2/2 [00:33<00:00, 16.98s/job]
-
-Successfully extracted 4 total jobs (including pipeline children) to data/jobs.json
-
---- REPLAY PHASE ---
-Loading job metadata...
-Loaded 4 job metadata records.
-Grouped into 2 original execution units (pipelines/standalone jobs).
-Connected to target workspace: target-dummy-workspace
-Ensuring dummy environment 'dummy-env:1.1.0' exists...
- -> Environment 'dummy-env:1.1.0' is ready.
-
-Processing original unit 1/2: labeling_Inference_7b9f679c_1698238717415 (1 records)
- -> Identified as Standalone Job: labeling_Inference_7b9f679c_1698238717415
-   Submitting replay job/pipeline...
-Uploading tmpxsog0z4x.json (< 1 MB): 100%|##########################################################################| 96.0/96.0 [00:00<00:00, 1.69kB/s]
-
-
-   ✔ Submitted: good_soca_c4pwx5s48k (Type: command) for original: labeling_Inference_7b9f679c_1698238717415
-
-Processing original unit 2/2: 607d6225-20a0-4f26-a160-b6fd6bbe6ee0 (3 records)
- -> Identified as Pipeline Job: 607d6225-20a0-4f26-a160-b6fd6bbe6ee0 (2 children)
-   Submitting replay job/pipeline...
-Uploading metrics_66aefbd1-ca5d-4de7-9562-17f89a7e839e.json (< 1 MB): 100%|##########################################################################| 2.00/2.00 [00:00<00:00, 33.2B/s]
-
-
-Uploading metrics_bb493013-cd0c-480b-a994-6d77811d3438.json (< 1 MB): 100%|##########################################################################| 2.00/2.00 [00:00<00:00, 33.6B/s]
-
-
-   ✔ Submitted: gifted_guava_kczbhpxx6x (Type: pipeline) for original: 607d6225-20a0-4f26-a160-b6fd6bbe6ee0
-
---- Replay Summary ---
-Total original units found: 2
-Units processed (due to limit or completion): 2
-Successfully submitted replay jobs/pipelines: 2
-Failed submissions or builds: 0
-Skipped due to structure issues: 0
-Original ID -> Replay Job Name/Status Mapping:
- - labeling_Inference_7b9f679c_1698238717415 -> good_soca_c4pwx5s48k
- - 607d6225-20a0-4f26-a160-b6fd6bbe6ee0 -> gifted_guava_kczbhpxx6x
-----------------------
-
-✅ AzureML Job Replayer completed successfully
-```
+(Example output unchanged; see earlier section.)
 
 ---
 
 ## 🛠️ Troubleshooting
 
 - **Issue:** `ModuleNotFoundError: No module named 'azureml'`  
-  **Solution:** Ensure dependencies are installed using `uv install` or `pip install -r requirements.txt`.
+  **Solution:** Install dependencies via `uv install` or `pip install -r requirements.txt`.
 
 - **Issue:** `Authentication failed`  
-  **Solution:** Make sure you are logged into Azure CLI using `az login` and have write permissions and access (network) to the target workspace storage account.
+  **Solution:** Ensure `az login` and correct RBAC + network access.
+
+- **Issue:** Included job names not found  
+  **Solution:** Verify exact names (`jobs list` in AzureML Studio / SDK) and case.
 
 ---
 
 ## 🗺️ Roadmap
 
-- [ ] Support artifact copy (e.g. retain model artifacts or job outputs)
+- [ ] Support artifact copy (retain model artifacts / outputs)
 - [ ] Support output logs copy
-- [ ] CLI flags for selective job subset
-- [ ] Support job filtering by tags/date ranges
+- [ ] Edge reconstruction (job input/output wiring)
+- [ ] Tag/date range filters
+- [ ] Optional depth limit or exclude patterns
+- [x] CLI flags for selective job subset (include list/file)
+- [x] Recursive nested pipeline traversal
+
+---
+
+## 🌐 Cross-Tenant Migration (Extraction in Tenant A → Replay in Tenant B)
+
+You can migrate jobs between completely separate Azure AD tenants. The workflow is a two‑phase, two‑login process:
+
+### High-Level Steps
+
+1. Login to Tenant A (source), extract jobs to a JSON file.
+2. Logout (or switch), then login to Tenant B (target).
+3. Replay the previously exported JSON into the target workspace.
+
+### 1. Extract from Tenant A
+
+```powershell
+# (Optional) Clear previous login
+az logout
+
+# Login explicitly to source tenant
+az login --tenant <TENANT_A_ID>
+
+# Pick the right subscription (if multiple)
+az account set --subscription <SOURCE_SUBSCRIPTION_ID>
+
+# Sanity check
+az account show --output table
+
+# Run extraction (optionally selective)
+python -m extractor.extract_jobs `
+  --source config/source_config.json `
+  --output data/source_jobs.json `
+  --include-file job_names.txt  # optional
+```
+
+Make sure `config/source_config.json` has:
+
+```jsonc
+{
+  "subscription_id": "<SOURCE_SUBSCRIPTION_ID>",
+  "resource_group": "<SOURCE_RG>",
+  "workspace_name": "<SOURCE_WORKSPACE>"
+}
+```
+
+### 2. Replay into Tenant B
+
+```powershell
+# Switch tenant
+az logout
+az login --tenant <TENANT_B_ID>
+az account set --subscription <TARGET_SUBSCRIPTION_ID>
+az account show --output table
+
+# Replay (dry run first recommended)
+python -m replayer.build_pipeline `
+  --input data/source_jobs.json `
+  --target config/target_config.json `
+  --dry-run
+
+# If looks good, run without --dry-run
+python -m replayer.build_pipeline `
+  --input data/source_jobs.json `
+  --target config/target_config.json
+```
+
+`config/target_config.json`:
+
+```jsonc
+{
+  "subscription_id": "<TARGET_SUBSCRIPTION_ID>",
+  "resource_group": "<TARGET_RG>",
+  "workspace_name": "<TARGET_WORKSPACE>"
+}
+```
+
+### What Gets Migrated
+
+- Job structural metadata (standalone + nested pipeline hierarchy)
+- Metrics, params, tags (MLflow)
+- Timestamps, command strings, environment identifiers (names/versions where resolvable)
+
+### What Does NOT (Yet) Automatically Migrate
+
+- Underlying artifacts / model files / outputs
+- Logs / stdout / stderr content
+- Dataset registrations or data assets
+- Exact environment/image replication (must exist or fallback dummy environment used)
+- Compute resources (must exist with same names or be adjusted manually)
+
+### Common Pitfalls & Tips
+
+| Issue                            | Cause                                            | Mitigation                                            |
+| -------------------------------- | ------------------------------------------------ | ----------------------------------------------------- |
+| AuthorizationFailed              | Logged into wrong tenant/subscription            | Run `az account show`; re-run `az login --tenant ...` |
+| Environment not found            | Source environment name/version absent in target | Provide/curate equivalent env or let replay use dummy |
+| Missing compute                  | Compute cluster name differs                     | Pre-create compute or edit replay config to override  |
+| Metrics present but no artifacts | Artifacts are stored in source storage account   | Add artifact copy logic (future roadmap)              |
+| Job count lower than expected    | Include filtering or limit applied               | Remove `--include/--limit` or verify names            |
+
+### Secure Handling
+
+The JSON file (`data/source_jobs.json`) contains only metadata/metrics—not secrets— but still treat it as internal IP if tags contain sensitive info.
 
 ---
 
 ## 🎓 License & Contributions
 
-MIT License. Feel free to fork and adapt. Contributions welcome!
+MIT License. Contributions welcome.
 
 ---
 
 ## 🤝 Contributing
 
-1. Fork the repository.
-2. Clone your fork: `git clone https://github.com/your-username/azureml-job-replayer.git`
-3. Create a new branch: `git checkout -b feature-name`
-4. Make your changes and commit them: `git commit -m "Add feature-name"`
-5. Push to your fork: `git push origin feature-name`
-6. Open a pull request.
-
-Feel free to open issues or PRs. For major changes, please open an issue first to discuss.
+1. Fork
+2. `git clone`
+3. `git checkout -b feature-name`
+4. Commit changes
+5. Push and open PR
 
 ---
 
 ## ❓ Getting Help
 
 - [AzureML Documentation](https://learn.microsoft.com/en-us/azure/machine-learning/)
-- Open an issue in this repository
+- Open an issue
 
-Reach out to the author or open an issue.
-*Built with ❤️ by Hendrik in VS Code.*
+_Built with ❤️ in VS Code._

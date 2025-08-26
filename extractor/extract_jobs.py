@@ -4,10 +4,10 @@ import argparse
 import json
 import logging
 import os
-import sys  # Import sys for stdout/stderr handlers
+import sys
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Set
 
 import mlflow
 from azure.ai.ml import MLClient
@@ -19,13 +19,9 @@ from mlflow.exceptions import MlflowException
 from mlflow.tracking import MlflowClient
 from tqdm import tqdm
 
-# Assuming utils.aml_clients is in the path or installed
 from utils.aml_clients import get_ml_client
 
 # --- Logging Setup ---
-
-# Remove basicConfig, we will configure handlers manually
-# logging.basicConfig(...)
 
 # Get our specific logger
 logger = logging.getLogger(__name__)
@@ -628,47 +624,74 @@ def _process_job_object(job: Job, mlflow_client: MlflowClient) -> Optional[JobMe
 
 
 def extract_all_jobs(
-    client: MLClient, limit: Optional[int] = None
+    client: MLClient,
+    limit: Optional[int] = None,
+    filter: Optional[
+        list[str]
+    ] = None,  # (kept for backward compatibility / future use)
+    include_names: Optional[Set[str]] = None,
 ) -> Iterator[JobMetadata]:
     """
-    Extract all top-level jobs AND their child jobs (for pipelines)
-    from the AzureML workspace and yield them one by one.
+    Extract selected top-level jobs (optionally restricted by include_names)
+    AND all their recursively nested child jobs (for pipelines),
+    yielding JobMetadata objects.
+
+    include_names:
+        If provided, only top-level jobs whose name is in this set are processed.
+        Their descendants are still fully traversed.
     """
     mlflow_tracking_uri = client.workspaces.get(
         client.workspace_name
     ).mlflow_tracking_uri
-
     logger.info(f"Using MLflow tracking URI: {mlflow_tracking_uri}")
     mlflow.set_tracking_uri(mlflow_tracking_uri)
     mlflow_client = MlflowClient()
 
-    all_job_summaries = []
     try:
         all_job_summaries = list(client.jobs.list())
     except Exception as e:
         logger.exception(f"Failed to list initial job summaries: {e}")
         return
 
-    # Apply limit to job summaries before creating the progress bar
     total_jobs = len(all_job_summaries)
-    if limit is not None and limit < total_jobs:
+
+    # Apply include_names filter (top-level only)
+    if include_names:
+        name_to_summary = {s.name: s for s in all_job_summaries}
+        missing = [n for n in include_names if n not in name_to_summary]
+        if missing:
+            logger.warning(
+                f"{len(missing)} requested top-level job name(s) not found and will be skipped: {missing}"
+            )
+        filtered_summaries = [
+            name_to_summary[n] for n in include_names if n in name_to_summary
+        ]
         print(
-            f"Found {total_jobs} total top-level job summaries. Limiting to {limit} as requested."
+            f"Top-level include filter active: {len(filtered_summaries)}/{total_jobs} jobs selected before limit."
         )
-        job_summaries_to_process = all_job_summaries[:limit]
     else:
+        filtered_summaries = all_job_summaries
         print(
             f"Found {total_jobs} total top-level job summaries. Starting extraction including children..."
         )
-        job_summaries_to_process = all_job_summaries
 
-    # Now use the limited list for tqdm
+    # Apply limit AFTER filtering (cap the number of selected roots)
+    if limit is not None and limit < len(filtered_summaries):
+        print(
+            f"Limiting selected top-level jobs to {limit} (from {len(filtered_summaries)} after filtering)."
+        )
+        job_summaries_to_process = filtered_summaries[:limit]
+    else:
+        job_summaries_to_process = filtered_summaries
+
+    visited: Set[str] = set()
+
     for job_summary in tqdm(
         job_summaries_to_process, desc="Processing Top-Level Jobs", unit="job"
     ):
         parent_job_name = job_summary.name
-
-        # 1. Get and Process the Parent/Top-Level Job
+        if parent_job_name in visited:
+            continue
         try:
             parent_job_object: Job = client.jobs.get(name=parent_job_name)
         except ResourceNotFoundError:
@@ -683,67 +706,101 @@ def extract_all_jobs(
             continue
 
         parent_metadata = _process_job_object(parent_job_object, mlflow_client)
-
-        if parent_metadata:
-            yield parent_metadata  # Yield the parent first
-
-            # 2. If it's a Pipeline, find and process its children
-            if parent_metadata.job_type == "pipeline":
-                logger.info(
-                    f"Pipeline job '{parent_job_name}' detected. Querying for child jobs..."
-                )
-                try:
-                    # Use parent_job_name to list children
-                    child_job_summaries = list(
-                        client.jobs.list(parent_job_name=parent_job_name)
-                    )
-                    logger.info(
-                        f"Found {len(child_job_summaries)} child jobs for '{parent_job_name}'."
-                    )
-
-                    for child_summary in child_job_summaries:
-                        child_job_name = child_summary.name
-                        try:
-                            child_job_object: Job = client.jobs.get(name=child_job_name)
-                            child_metadata = _process_job_object(
-                                child_job_object, mlflow_client
-                            )
-                            if child_metadata:
-                                # Double-check parent name consistency (should be set by _process_job_object already)
-                                if child_metadata.parent_job_name != parent_job_name:
-                                    logger.info(
-                                        f"Child job {child_job_name} has unexpected parent '{child_metadata.parent_job_name}', expected '{parent_job_name}'. Overwriting."
-                                    )  # This happens consistently (100%) and therefore should not be a warning
-                                    child_metadata.parent_job_name = parent_job_name
-                                yield child_metadata  # Yield the child
-                            else:
-                                logger.warning(
-                                    f"Failed to process child job object {child_job_name} for parent {parent_job_name}."
-                                )
-
-                        except ResourceNotFoundError:
-                            logger.warning(
-                                f"Child job {child_job_name} listed but GET failed (not found) for parent {parent_job_name}. Skipping child."
-                            )
-                        except Exception as e:
-                            logger.error(
-                                f"Failed to retrieve or process child job {child_job_name} for parent {parent_job_name}: {e}"
-                            )
-
-                except Exception as e:
-                    logger.error(
-                        f"Failed to list or process child jobs for pipeline {parent_job_name}: {e}"
-                    )
-        else:
+        if not parent_metadata:
             logger.warning(f"Failed to process top-level job object {parent_job_name}.")
+            continue
+
+        visited.add(parent_job_name)
+        yield parent_metadata
+
+        if parent_metadata.job_type == "pipeline":
+            yield from _traverse_pipeline_children(
+                client=client,
+                mlflow_client=mlflow_client,
+                root_pipeline_name=parent_job_name,
+                visited=visited,
+            )
+
+
+def _traverse_pipeline_children(
+    client: MLClient,
+    mlflow_client: MlflowClient,
+    root_pipeline_name: str,
+    visited: Set[str],
+) -> Iterator[JobMetadata]:
+    """
+    Depth-first traversal of all descendant jobs of a pipeline (handles nested pipelines).
+    Yields metadata for each child encountered exactly once.
+    """
+    stack: List[str] = [root_pipeline_name]
+
+    while stack:
+        current_parent = stack.pop()
+
+        try:
+            child_job_summaries = list(client.jobs.list(parent_job_name=current_parent))
+        except Exception as e:
+            logger.error(
+                f"Failed to list child jobs for pipeline {current_parent}: {e}"
+            )
+            continue
+
+        if child_job_summaries:
+            logger.info(
+                f"Found {len(child_job_summaries)} child jobs for pipeline '{current_parent}'."
+            )
+
+        for child_summary in child_job_summaries:
+            child_name = child_summary.name
+            if child_name in visited:
+                continue
+
+            try:
+                child_job_object: Job = client.jobs.get(name=child_name)
+            except ResourceNotFoundError:
+                logger.warning(
+                    f"Child job {child_name} listed but GET failed (not found) for parent {current_parent}. Skipping."
+                )
+                continue
+            except Exception as e:
+                logger.error(
+                    f"Failed to retrieve full details for child job {child_name} (parent {current_parent}): {e}"
+                )
+                continue
+
+            child_metadata = _process_job_object(child_job_object, mlflow_client)
+            if not child_metadata:
+                logger.warning(
+                    f"Failed to process child job object {child_name} (parent {current_parent})."
+                )
+                continue
+
+            # Ensure parent linkage is correct
+            if child_metadata.parent_job_name != current_parent:
+                logger.info(
+                    f"Child job {child_name} reported parent '{child_metadata.parent_job_name}', "
+                    f"expected '{current_parent}'. Overwriting."
+                )
+                child_metadata.parent_job_name = current_parent
+
+            visited.add(child_name)
+            yield child_metadata
+
+            if child_metadata.job_type == "pipeline":
+                # Explore its descendants
+                stack.append(child_name)
 
 
 # --- Main Execution ---
 
 
-def main(source_config: str, output_path: str, limit: Optional[int] = None):
+def main(
+    source_config: str,
+    output_path: str,
+    limit: Optional[int] = None,
+    include_names: Optional[Set[str]] = None,
+):
     setup_logging()
-
     try:
         source_client = get_ml_client(source_config)
         print(f"Connected to workspace: {source_client.workspace_name}")
@@ -765,18 +822,22 @@ def main(source_config: str, output_path: str, limit: Optional[int] = None):
     first_item = True
     try:
         with open(output_path, "w", encoding="utf-8") as f:
-            f.write("[")  # Start JSON array
-            for job_metadata in extract_all_jobs(source_client, limit=limit):
+            f.write("[")
+            for job_metadata in extract_all_jobs(
+                source_client,
+                limit=limit,
+                include_names=include_names,
+            ):
                 if not first_item:
                     f.write(",\n")
                 else:
                     first_item = False
                 f.write(json.dumps(job_metadata.to_dict(), indent=2))
                 job_count += 1
-            f.write("]")  # End JSON array
+            f.write("]")
 
         print(
-            f"\nSuccessfully extracted {job_count} total jobs (including pipeline children) to {output_path}"
+            f"\nSuccessfully extracted {job_count} total jobs (including descendants) to {output_path}"
         )
 
     except IOError as e:
@@ -787,7 +848,7 @@ def main(source_config: str, output_path: str, limit: Optional[int] = None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Extract AzureML job metadata (including pipeline children) to JSON"
+        description="Extract AzureML job metadata (including (nested) pipeline children) to JSON"
     )
     parser.add_argument(
         "--source", required=True, help="Path to source workspace config JSON"
@@ -797,7 +858,37 @@ if __name__ == "__main__":
         "--limit",
         type=int,
         default=None,
-        help="Optional limit on the number of jobs to extract",
+        help="Optional limit on number of TOP-LEVEL jobs to process (after filtering).",
+    )
+    parser.add_argument(
+        "--include",
+        help="Comma-separated list of top-level job names to include (exact match).",
+    )
+    parser.add_argument(
+        "--include-file",
+        help="Path to a text file with one top-level job name per line to include.",
     )
     args = parser.parse_args()
-    main(args.source, args.output, args.limit)
+
+    include_names: Set[str] = set()
+    if args.include:
+        include_names.update(n.strip() for n in args.include.split(",") if n.strip())
+    if args.include_file:
+        try:
+            with open(args.include_file, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    name = line.strip()
+                    if name:
+                        include_names.add(name)
+        except OSError as e:
+            print(f"WARNING: Failed to read include file '{args.include_file}': {e}")
+
+    if not include_names:
+        include_names = None  # Pass None instead of empty set for clarity
+
+    main(
+        args.source,
+        args.output,
+        args.limit,
+        include_names=include_names,
+    )
