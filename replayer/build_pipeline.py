@@ -11,7 +11,11 @@ from azure.ai.ml import (
     Input,
 )
 from azure.ai.ml.constants import AssetTypes
-from azure.ai.ml.entities import PipelineJob, PipelineJobSettings, UserIdentityConfiguration
+from azure.ai.ml.entities import (
+    PipelineJob,
+    PipelineJobSettings,
+    UserIdentityConfiguration,
+)
 from azure.core.exceptions import HttpResponseError
 
 from extractor.extract_jobs import JobMetadata
@@ -382,6 +386,7 @@ def main(args):
                     # Add environment check for dry run
                     env_id = None
                     from azure.ai.ml.entities import CommandJob as _CommandJob
+
                     if isinstance(job_to_submit, _CommandJob):
                         env_id = job_to_submit.environment
                     elif isinstance(job_to_submit, PipelineJob) and job_to_submit.jobs:
