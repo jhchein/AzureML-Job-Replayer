@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import sys
+import random
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, List, Optional, Set
@@ -630,6 +631,10 @@ def extract_all_jobs(
         list[str]
     ] = None,  # (kept for backward compatibility / future use)
     include_names: Optional[Set[str]] = None,
+    automl_max_trials: Optional[int] = None,
+    automl_top_metric: Optional[str] = None,
+    automl_trial_sampling: str = "best",  # best|first|random
+    automl_include_trials: bool = True,
 ) -> Iterator[JobMetadata]:
     """
     Extract selected top-level jobs (optionally restricted by include_names)
@@ -689,72 +694,89 @@ def extract_all_jobs(
     for job_summary in tqdm(
         job_summaries_to_process, desc="Processing Top-Level Jobs", unit="job"
     ):
-        parent_job_name = job_summary.name
-        if parent_job_name in visited:
+        root_job_name = job_summary.name
+        if root_job_name in visited:
             continue
         try:
-            parent_job_object: Job = client.jobs.get(name=parent_job_name)
+            root_job_object: Job = client.jobs.get(name=root_job_name)
         except ResourceNotFoundError:
             logger.warning(
-                f"Top-level job {parent_job_name} summary found but GET failed (not found). Skipping."
+                f"Top-level job {root_job_name} summary found but GET failed (not found). Skipping."
             )
             continue
         except Exception as e:
             logger.error(
-                f"Failed to retrieve full job details for top-level job {parent_job_name}: {e}. Skipping."
+                f"Failed to retrieve full job details for top-level job {root_job_name}: {e}. Skipping."
             )
             continue
 
-        parent_metadata = _process_job_object(parent_job_object, mlflow_client)
-        if not parent_metadata:
-            logger.warning(f"Failed to process top-level job object {parent_job_name}.")
+        root_metadata = _process_job_object(root_job_object, mlflow_client)
+        if not root_metadata:
+            logger.warning(f"Failed to process top-level job object {root_job_name}.")
             continue
 
-        visited.add(parent_job_name)
-        yield parent_metadata
+        visited.add(root_job_name)
+        yield root_metadata
 
-        if parent_metadata.job_type == "pipeline":
-            yield from _traverse_pipeline_children(
-                client=client,
-                mlflow_client=mlflow_client,
-                root_pipeline_name=parent_job_name,
-                visited=visited,
-            )
+        # Always traverse descendants (not only pipelines) to capture AutoML / Sweep / nested structures
+        yield from _traverse_descendants(
+            client=client,
+            mlflow_client=mlflow_client,
+            root_name=root_job_name,
+            visited=visited,
+            automl_max_trials=automl_max_trials,
+            automl_top_metric=automl_top_metric,
+            automl_trial_sampling=automl_trial_sampling,
+            automl_include_trials=automl_include_trials,
+        )
 
 
-def _traverse_pipeline_children(
+def _traverse_descendants(
     client: MLClient,
     mlflow_client: MlflowClient,
-    root_pipeline_name: str,
+    root_name: str,
     visited: Set[str],
+    automl_max_trials: Optional[int],
+    automl_top_metric: Optional[str],
+    automl_trial_sampling: str,
+    automl_include_trials: bool,
 ) -> Iterator[JobMetadata]:
-    """
-    Depth-first traversal of all descendant jobs of a pipeline (handles nested pipelines).
-    Yields metadata for each child encountered exactly once.
-    """
-    stack: List[str] = [root_pipeline_name]
+    """Generic depth-first traversal of all descendant jobs (pipelines, AutoML, sweeps, etc.)."""
+    stack: List[str] = [root_name]
 
     while stack:
         current_parent = stack.pop()
 
+        # Fetch parent to detect type & properties
+        try:
+            parent_job_obj: Job = client.jobs.get(name=current_parent)
+            parent_type_raw = getattr(parent_job_obj, "type", "") or ""
+            parent_type = parent_type_raw.lower()
+            parent_properties = getattr(parent_job_obj, "properties", {}) or {}
+            parent_tags = getattr(parent_job_obj, "tags", {}) or {}
+        except Exception:
+            parent_type = ""
+            parent_properties = {}
+            parent_tags = {}
+
         try:
             child_job_summaries = list(client.jobs.list(parent_job_name=current_parent))
         except Exception as e:
-            logger.error(
-                f"Failed to list child jobs for pipeline {current_parent}: {e}"
-            )
+            logger.error(f"Failed to list child jobs for parent {current_parent}: {e}")
             continue
 
-        if child_job_summaries:
-            logger.info(
-                f"Found {len(child_job_summaries)} child jobs for pipeline '{current_parent}'."
-            )
+        if not child_job_summaries:
+            continue
 
+        logger.info(
+            f"Found {len(child_job_summaries)} child jobs for parent '{current_parent}'."
+        )
+
+        processed_children: List[JobMetadata] = []
         for child_summary in child_job_summaries:
             child_name = child_summary.name
             if child_name in visited:
                 continue
-
             try:
                 child_job_object: Job = client.jobs.get(name=child_name)
             except ResourceNotFoundError:
@@ -767,28 +789,93 @@ def _traverse_pipeline_children(
                     f"Failed to retrieve full details for child job {child_name} (parent {current_parent}): {e}"
                 )
                 continue
-
             child_metadata = _process_job_object(child_job_object, mlflow_client)
             if not child_metadata:
                 logger.warning(
                     f"Failed to process child job object {child_name} (parent {current_parent})."
                 )
                 continue
-
-            # Ensure parent linkage is correct
             if child_metadata.parent_job_name != current_parent:
-                logger.info(
-                    f"Child job {child_name} reported parent '{child_metadata.parent_job_name}', "
-                    f"expected '{current_parent}'. Overwriting."
-                )
                 child_metadata.parent_job_name = current_parent
+            processed_children.append(child_metadata)
 
+        # Detect AutoML parent (can present as type 'automl' OR a step with runTemplate AutoML / StepType AutoMLStep)
+        is_automl_parent = False
+        if parent_type == "automl":
+            is_automl_parent = True
+        else:
+            run_template = parent_properties.get("runTemplate")
+            step_type = parent_properties.get("StepType")
+            pipeline_component = parent_properties.get("azureml.pipelineComponent", "")
+            if (
+                run_template == "AutoML"
+                or step_type == "AutoMLStep"
+                or pipeline_component.startswith("masterautoml")
+                or "automl_best_child_run_id" in parent_tags
+            ):
+                is_automl_parent = True
+
+        if is_automl_parent:
+            if not automl_include_trials:
+                logger.info(
+                    f"AutoML trials excluded for parent {current_parent}; skipping its child trials."
+                )
+                # Still yield the AutoML parent itself (already yielded earlier) – skip its children
+                continue
+            if processed_children:
+                primary_metric = automl_top_metric
+                if not primary_metric:
+                    for cm in processed_children:
+                        if cm.mlflow_metrics:
+                            for k, v in cm.mlflow_metrics.items():
+                                if isinstance(v, (int, float)):
+                                    primary_metric = k
+                                    break
+                        if primary_metric:
+                            break
+                scored = []
+                unscored = []
+                for cm in processed_children:
+                    val = None
+                    if primary_metric and cm.mlflow_metrics:
+                        metric_val = cm.mlflow_metrics.get(primary_metric)
+                        if isinstance(metric_val, (int, float)):
+                            val = float(metric_val)
+                    if val is not None:
+                        scored.append((val, cm))
+                    else:
+                        unscored.append(cm)
+                if automl_trial_sampling == "first":
+                    selected_children = processed_children
+                elif automl_trial_sampling == "random":
+                    random.shuffle(processed_children)
+                    selected_children = processed_children
+                else:  # best
+                    if scored:
+                        scored.sort(key=lambda x: x[0], reverse=True)
+                        ordered = [c for _, c in scored] + unscored
+                        selected_children = ordered
+                    else:
+                        selected_children = processed_children
+                if (
+                    automl_max_trials is not None
+                    and len(selected_children) > automl_max_trials
+                ):
+                    logger.info(
+                        f"AutoML trial cap: keeping top {automl_max_trials} of {len(selected_children)} for parent {current_parent}."
+                    )
+                    selected_children = selected_children[:automl_max_trials]
+                processed_children = selected_children
+
+        # Yield children and push each onto stack for further traversal (generic approach)
+        for child_metadata in processed_children:
+            child_name = child_metadata.name
+            if child_name in visited:
+                continue
             visited.add(child_name)
             yield child_metadata
-
-            if child_metadata.job_type == "pipeline":
-                # Explore its descendants
-                stack.append(child_name)
+            # Always attempt further traversal (cheap if no children)
+            stack.append(child_name)
 
 
 # --- Main Execution ---
@@ -799,6 +886,10 @@ def main(
     output_path: str,
     limit: Optional[int] = None,
     include_names: Optional[Set[str]] = None,
+    automl_max_trials: Optional[int] = None,
+    automl_top_metric: Optional[str] = None,
+    automl_trial_sampling: str = "best",
+    automl_include_trials: bool = True,
 ):
     setup_logging()
     try:
@@ -827,6 +918,10 @@ def main(
                 source_client,
                 limit=limit,
                 include_names=include_names,
+                automl_max_trials=automl_max_trials,
+                automl_top_metric=automl_top_metric,
+                automl_trial_sampling=automl_trial_sampling,
+                automl_include_trials=automl_include_trials,
             ):
                 if not first_item:
                     f.write(",\n")
@@ -868,6 +963,30 @@ if __name__ == "__main__":
         "--include-file",
         help="Path to a text file with one top-level job name per line to include.",
     )
+    parser.add_argument(
+        "--automl-max-trials",
+        type=int,
+        default=None,
+        help="Limit number of AutoML trial child jobs per AutoML parent (after ranking).",
+    )
+    parser.add_argument(
+        "--automl-top-metric",
+        type=str,
+        default=None,
+        help="Primary metric name to rank AutoML trials; if omitted, inferred from first numeric metric encountered.",
+    )
+    parser.add_argument(
+        "--automl-trial-sampling",
+        type=str,
+        choices=["best", "first", "random"],
+        default="best",
+        help="Sampling strategy for selecting AutoML trials when limiting: best (by metric), first (original order), random (shuffle).",
+    )
+    parser.add_argument(
+        "--no-automl-trials",
+        action="store_true",
+        help="Exclude AutoML trial child jobs entirely; only export parent AutoML job metadata.",
+    )
     args = parser.parse_args()
 
     include_names: Set[str] = set()
@@ -891,4 +1010,8 @@ if __name__ == "__main__":
         args.output,
         args.limit,
         include_names=include_names,
+        automl_max_trials=args.automl_max_trials,
+        automl_top_metric=args.automl_top_metric,
+        automl_trial_sampling=args.automl_trial_sampling,
+        automl_include_trials=not args.no_automl_trials,
     )

@@ -5,7 +5,8 @@ import os
 import shutil
 import tempfile
 import uuid
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Dict, List, Optional, Tuple, Set, Any
+import random
 
 from azure.ai.ml import (
     Input,
@@ -96,45 +97,189 @@ def build_dummy_pipeline_for_children(
     parent_job: JobMetadata,
     child_jobs: List[JobMetadata],
     temp_dir_path: str,
+    *,
+    children_map: Dict[str, List[JobMetadata]],
+    jobs_by_name: Dict[str, JobMetadata],
+    expand_automl_trials: bool = False,
+    replay_automl_max_trials: Optional[int] = None,
+    replay_automl_top_metric: Optional[str] = None,
+    replay_automl_trial_sampling: str = "best",  # best|first|random
 ) -> Optional[PipelineJob]:
     if not child_jobs:
         return None
 
-    pipeline_steps_dict = {}
-    # Use a context manager for temp dir if creating many files
-    # with tempfile.TemporaryDirectory() as temp_dir:
-    # print(f"DEBUG: Using temp dir for metrics files: {temp_dir}")
-    for child_job in child_jobs:
-        metrics_to_log = child_job.mlflow_metrics or {}
+    def is_automl_parent(jm: JobMetadata) -> bool:
+        if not jm:
+            return False
+        props = jm.job_properties or {}
+        tags = jm.tags or {}
+        jt = (jm.job_type or "").lower()
+        if jt == "automl":
+            return True
+        if props.get("runTemplate") == "AutoML":
+            return True
+        if props.get("StepType") == "AutoMLStep":
+            return True
+        if props.get("azureml.pipelineComponent", "").startswith("masterautoml"):
+            return True
+        if "automl_best_child_run_id" in tags:
+            return True
+        return False
 
-        # --- Create temp JSON file ---
+    def select_trials(trials: List[JobMetadata]) -> List[JobMetadata]:
+        if not trials:
+            return []
+        primary_metric = replay_automl_top_metric
+        # Infer metric if not provided
+        if not primary_metric:
+            for t in trials:
+                if t.mlflow_metrics:
+                    for k, v in t.mlflow_metrics.items():
+                        if isinstance(v, (int, float)):
+                            primary_metric = k
+                            break
+                if primary_metric:
+                    break
+        if replay_automl_trial_sampling == "first" or not primary_metric:
+            ordered = trials
+        elif replay_automl_trial_sampling == "random":
+            ordered = trials[:]
+            random.shuffle(ordered)
+        else:  # best
+            scored: List[Tuple[float, JobMetadata]] = []
+            unscored: List[JobMetadata] = []
+            for t in trials:
+                mv = (
+                    t.mlflow_metrics.get(primary_metric)
+                    if t.mlflow_metrics and primary_metric in t.mlflow_metrics
+                    else None
+                )
+                if isinstance(mv, (int, float)):
+                    scored.append((float(mv), t))
+                else:
+                    unscored.append(t)
+            if scored:
+                # Assume higher is better (could parse goal later)
+                scored.sort(key=lambda x: x[0], reverse=True)
+                ordered = [t for _, t in scored] + unscored
+            else:
+                ordered = trials
+        if (
+            replay_automl_max_trials is not None
+            and len(ordered) > replay_automl_max_trials
+        ):
+            print(
+                f" -> AutoML trial cap: trimming from {len(ordered)} to {replay_automl_max_trials} trials."
+            )
+            ordered = ordered[:replay_automl_max_trials]
+        return ordered
+
+    def gather_all_descendants(root_name: str) -> List[JobMetadata]:
+        """Return all descendant jobs (recursive) under a given job name."""
+        collected: List[JobMetadata] = []
+        stack = list(children_map.get(root_name, []))
+        while stack:
+            node = stack.pop()
+            collected.append(node)
+            stack.extend(children_map.get(node.name, []))
+        return collected
+
+    # Build structured list of effective steps with roles & metadata.
+    # Each element: { 'meta': JobMetadata, 'role': 'normal'|'automl_parent'|'automl_trial',
+    #                 'parent_name': <str or None>, 'rank': <int or None>,
+    #                 'total_trials': <int or None>, 'selected_trials': <int or None>,
+    #                 'primary_metric': <str or None>, 'is_best': <bool or None> }
+    effective_children: List[Dict[str, Any]] = []
+    for child in child_jobs:
+        if expand_automl_trials and is_automl_parent(child):
+            direct_candidates = children_map.get(child.name, [])
+            deep_desc = gather_all_descendants(child.name)
+            leaf_desc = [d for d in deep_desc if not children_map.get(d.name)]
+            # Prefer leaves; if none (unlikely) fall back to direct children list
+            trials = leaf_desc if leaf_desc else direct_candidates
+            if trials:
+                print(
+                    f" -> Expanding AutoML parent '{child.display_name or child.name}': {len(trials)} candidate trial(s) (direct={len(direct_candidates)}, leaves={len(leaf_desc)})."
+                )
+                selected = select_trials(trials)
+                print(
+                    f"    -> Selected {len(selected)} trial(s) after sampling/limits."
+                )
+                total_trials = len(trials)
+                selected_count = len(selected)
+                # Add parent first (always retained now)
+                effective_children.append(
+                    {
+                        "meta": child,
+                        "role": "automl_parent",
+                        "parent_name": parent_job.name,
+                        "rank": None,
+                        "total_trials": total_trials,
+                        "selected_trials": selected_count,
+                        "primary_metric": replay_automl_top_metric,
+                        "is_best": False,
+                    }
+                )
+                # Trials ordered as returned by select_trials (deterministic under 'best')
+                for idx, tmeta in enumerate(selected, start=1):
+                    effective_children.append(
+                        {
+                            "meta": tmeta,
+                            "role": "automl_trial",
+                            "parent_name": child.name,
+                            "rank": idx,
+                            "total_trials": total_trials,
+                            "selected_trials": selected_count,
+                            "primary_metric": replay_automl_top_metric,
+                            "is_best": idx == 1,
+                        }
+                    )
+                continue  # skip default append
+        # Non-AutoML or not expanding
+        effective_children.append(
+            {
+                "meta": child,
+                "role": "normal",
+                "parent_name": parent_job.name,
+                "rank": None,
+                "total_trials": None,
+                "selected_trials": None,
+                "primary_metric": None,
+                "is_best": False,
+            }
+        )
+
+    pipeline_steps_dict = {}
+    for step_info in effective_children:
+        step_job_meta: JobMetadata = step_info["meta"]
+        metrics_to_log = step_job_meta.mlflow_metrics or {}
         metrics_json_str = json.dumps(metrics_to_log)
-        # Create a unique filename
         temp_filename = f"metrics_{uuid.uuid4()}.json"
         temp_filepath = os.path.join(temp_dir_path, temp_filename)
         try:
             with open(temp_filepath, "w") as f:
                 f.write(metrics_json_str)
-            # print(
-            #     f"DEBUG [Pipeline Step {child_job.name}]: Created temp metrics file: {temp_filepath}"
-            # )
         except IOError as e:
             print(f"ERROR: Failed to write temp metrics file {temp_filepath}: {e}")
-            # TODO: Consider how to handle this - skip step? Fail pipeline build?
-            # For now, let's skip the step
-            continue  # Skip this step if file cannot be created
+            continue
 
-        # --- Call component, passing FILE PATH via Input ---
         step = replay_metrics_component(
-            original_job_id=child_job.name,
-            # Pass an Input object pointing to the temp file
+            original_job_id=step_job_meta.name,
             metrics_file=Input(type=AssetTypes.URI_FILE, path=temp_filepath),
         )
 
-        # step.compute = "serverless" # (compute defaults to pipeline setting)
+        # Naming strategy
+        base_display = step_job_meta.display_name or step_job_meta.name
+        if step_info["role"] == "automl_parent":
+            base_name_core = f"automl_parent_{step_job_meta.name[:8]}"
+        elif step_info["role"] == "automl_trial":
+            rank = step_info.get("rank") or 0
+            base_name_core = f"automl_trial_{rank:03d}_{step_job_meta.name[:8]}"
+        else:
+            base_name_core = base_display
+
         sanitized_step_key = "".join(
-            c if c.isalnum() or c in ["-", "_"] else "_"
-            for c in (child_job.display_name or child_job.name)[:50]
+            c if c.isalnum() or c in ["-", "_"] else "_" for c in base_name_core[:60]
         )
         count = 1
         final_key = sanitized_step_key
@@ -142,15 +287,41 @@ def build_dummy_pipeline_for_children(
             final_key = f"{sanitized_step_key}_{count}"
             count += 1
         step.name = final_key
-        step.display_name = f"replay_{child_job.display_name or child_job.name}"
-        step.tags = child_job.tags or {}
-        step.tags[ORIGINAL_JOB_ID_TAG] = child_job.name
+        if step_info["role"] == "automl_parent":
+            step.display_name = f"replay_automl_parent_{base_display}"
+        elif step_info["role"] == "automl_trial":
+            rank = step_info.get("rank") or 0
+            step.display_name = f"replay_automl_trial_{rank:03d}_{base_display}"
+        else:
+            step.display_name = f"replay_{base_display}"
+
+        step.tags = step_job_meta.tags.copy() if step_job_meta.tags else {}
+        step.tags[ORIGINAL_JOB_ID_TAG] = step_job_meta.name
         step.tags["original_parent_job_id"] = parent_job.name
+        if step_info["role"].startswith("automl"):
+            step.tags["expanded_automl_trial"] = "true"
+            step.tags["automl_role"] = step_info["role"]
+            if step_info["role"] == "automl_trial":
+                if step_info.get("rank") is not None:
+                    step.tags["automl_trial_rank"] = str(step_info["rank"])
+                if step_info.get("is_best"):
+                    step.tags["automl_best_trial"] = "true"
+                step.tags["automl_parent_id"] = (
+                    step_info.get("parent_name") or parent_job.name
+                )
+            elif step_info["role"] == "automl_parent":
+                if step_info.get("total_trials") is not None:
+                    step.tags["automl_total_trials"] = str(step_info["total_trials"])
+                if step_info.get("selected_trials") is not None:
+                    step.tags["automl_expanded_trials_count"] = str(
+                        step_info["selected_trials"]
+                    )
+                if step_info.get("primary_metric"):
+                    step.tags["automl_metric_primary"] = step_info["primary_metric"]
 
         pipeline_steps_dict[final_key] = step
 
-    # --- Construct PipelineJob (outside temp dir context is fine) ---
-    if not pipeline_steps_dict:  # Check if any steps were actually added
+    if not pipeline_steps_dict:
         print("Warning: No steps added to pipeline, possibly due to file errors.")
         return None
 
@@ -225,6 +396,24 @@ def main(args):
         for jm in all_jobs_metadata
         if jm.name not in pipeline_names and not jm.parent_job_name
     ]
+
+    # Promote standalone AutoML jobs to pipeline units if we want to expand trials
+    if args.expand_automl_trials:
+        promoted = []
+        for name in standalone_root_names[:]:
+            meta = jobs_by_name[name]
+            jt = (meta.job_type or "").lower()
+            if (
+                jt == "automl"
+                or (meta.job_properties or {}).get("runTemplate") == "AutoML"
+            ):
+                pipeline_names.add(name)
+                standalone_root_names.remove(name)
+                promoted.append(name)
+        if promoted:
+            print(
+                f"Promoted {len(promoted)} standalone AutoML root job(s) to pipeline units for trial expansion: {promoted}"
+            )
     # Order units by depth then name for deterministic processing (roots first)
     pipeline_unit_names = sorted(pipeline_names, key=lambda n: (depths.get(n, 0), n))
     standalone_root_names = sorted(
@@ -295,215 +484,160 @@ def main(args):
             f"\nProcessing replay unit {processed_count}/{total_units if args.limit is None else min(total_units, args.limit)}: {job_name} (type={unit_type}, depth={depths.get(job_name, 0)})"
         )
 
-        job_to_submit: Optional[object] = None  # PipelineJob or CommandJob-like object
+        job_to_submit: Optional[object] = None
         original_identifier = job_name
         temp_metrics_filepath_standalone = None
         temp_pipeline_dir_path = None
 
+        # Build job object
         try:
-            try:
-                if unit_type == "standalone":
-                    original_job_metadata = jm
-                    print(f" -> Standalone root job: {original_job_metadata.name}")
-                    metrics_to_log = original_job_metadata.mlflow_metrics or {}
+            if unit_type == "standalone":
+                original_job_metadata = jm
+                print(f" -> Standalone root job: {original_job_metadata.name}")
+                metrics_to_log = original_job_metadata.mlflow_metrics or {}
+                metrics_json_str = json.dumps(metrics_to_log)
+                with tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".json", delete=False, encoding="utf-8"
+                ) as temp_f:
+                    temp_metrics_filepath_standalone = temp_f.name
+                    temp_f.write(metrics_json_str)
+                job_to_submit = build_dummy_standalone_job(
+                    original_job_metadata, temp_metrics_filepath_standalone
+                )
+            elif unit_type == "pipeline":
+                parent_meta = jm
+                children_meta = children_map.get(parent_meta.name, [])
+                if children_meta:
+                    print(
+                        f" -> Pipeline job with {len(children_meta)} direct child job(s)."
+                    )
+                    temp_pipeline_dir_path = tempfile.mkdtemp()
+                    job_to_submit = build_dummy_pipeline_for_children(
+                        parent_meta,
+                        children_meta,
+                        temp_pipeline_dir_path,
+                        children_map=children_map,
+                        jobs_by_name=jobs_by_name,
+                        expand_automl_trials=args.expand_automl_trials,
+                        replay_automl_max_trials=args.replay_automl_max_trials,
+                        replay_automl_top_metric=args.replay_automl_top_metric,
+                        replay_automl_trial_sampling=args.replay_automl_trial_sampling,
+                    )
+                    if job_to_submit is None:
+                        print(
+                            " -> No steps generated (possibly no metrics). Falling back to standalone replay for pipeline parent."
+                        )
+                if not children_meta or job_to_submit is None:
+                    metrics_to_log = parent_meta.mlflow_metrics or {}
                     metrics_json_str = json.dumps(metrics_to_log)
-                    try:
-                        with tempfile.NamedTemporaryFile(
-                            mode="w", suffix=".json", delete=False, encoding="utf-8"
-                        ) as temp_f:
-                            temp_metrics_filepath_standalone = temp_f.name
-                            temp_f.write(metrics_json_str)
-                    except IOError as e:
-                        raise IOError(
-                            f"Failed to write temp metrics file for standalone job {original_identifier}: {e}"
-                        )
+                    with tempfile.NamedTemporaryFile(
+                        mode="w", suffix=".json", delete=False, encoding="utf-8"
+                    ) as temp_f:
+                        temp_metrics_filepath_standalone = temp_f.name
+                        temp_f.write(metrics_json_str)
                     job_to_submit = build_dummy_standalone_job(
-                        original_job_metadata, temp_metrics_filepath_standalone
+                        parent_meta, temp_metrics_filepath_standalone
                     )
-                elif unit_type == "pipeline":
-                    parent_meta = jm
-                    children_meta = children_map.get(parent_meta.name, [])
-                    if children_meta:
-                        print(
-                            f" -> Pipeline job with {len(children_meta)} direct child job(s)."
-                        )
-                        try:
-                            temp_pipeline_dir_path = tempfile.mkdtemp()
-                        except OSError as e:
-                            raise OSError(
-                                f"Failed to create temp directory for pipeline {original_identifier}: {e}"
-                            )
-                        job_to_submit = build_dummy_pipeline_for_children(
-                            parent_meta, children_meta, temp_pipeline_dir_path
-                        )
-                        if job_to_submit is None:
-                            print(
-                                " -> No steps generated (possibly no metrics). Falling back to standalone replay for pipeline parent."
-                            )
-                    if not children_meta or job_to_submit is None:
-                        metrics_to_log = parent_meta.mlflow_metrics or {}
-                        metrics_json_str = json.dumps(metrics_to_log)
-                        try:
-                            with tempfile.NamedTemporaryFile(
-                                mode="w", suffix=".json", delete=False, encoding="utf-8"
-                            ) as temp_f:
-                                temp_metrics_filepath_standalone = temp_f.name
-                                temp_f.write(metrics_json_str)
-                        except IOError as e:
-                            raise IOError(
-                                f"Failed to write temp metrics file for pipeline-as-standalone job {original_identifier}: {e}"
-                            )
-                        job_to_submit = build_dummy_standalone_job(
-                            parent_meta, temp_metrics_filepath_standalone
-                        )
-                else:
-                    print(f" -> Unknown unit type '{unit_type}'. Skipping.")
-                    skipped_count += 1
-                    continue
-
-            except Exception as build_error:
-                print(
-                    f"   ❌ Error building job object for original {original_identifier}: {build_error}"
-                )
-                failed_count += 1
-                # Note: No submission attempt, so jump straight to finally for cleanup
-                raise  # Re-raise to trigger the outer finally block for cleanup
-
-            # Submit the job or perform dry run, THEN clean up
-            if job_to_submit:
-                if args.dry_run:
-                    print(f"\n--- DRY RUN for Original Unit: {original_identifier} ---")
-                    local_path_info = "N/A"
-                    if temp_metrics_filepath_standalone:
-                        local_path_info = temp_metrics_filepath_standalone
-                    elif temp_pipeline_dir_path:
-                        local_path_info = f"(Files in {temp_pipeline_dir_path})"
-                    print(f"  Metrics File Input Path(s) (LOCAL): {local_path_info}")
-                    print(f"  Would submit Job Type: {type(job_to_submit).__name__}")
-                    print(f"  Display Name: {job_to_submit.display_name}")
-                    print(f"  Experiment Name: {job_to_submit.experiment_name}")
-                    print(f"  Tags: {job_to_submit.tags}")
-                    # Add environment check for dry run
-                    env_id = None
-                    from azure.ai.ml.entities import CommandJob as _CommandJob
-
-                    if isinstance(job_to_submit, _CommandJob):
-                        env_id = job_to_submit.environment
-                    elif isinstance(job_to_submit, PipelineJob) and job_to_submit.jobs:
-                        # Check env on first step as representative
-                        first_step_key = next(iter(job_to_submit.jobs))
-                        env_id = job_to_submit.jobs[first_step_key].environment
-                    print(f"  Environment: {env_id}")
-
-                    if isinstance(job_to_submit, PipelineJob):
-                        print(f"  Pipeline Steps ({len(job_to_submit.jobs)}):")
-                        for step_name, step_job in job_to_submit.jobs.items():
-                            comp_name = "N/A"
-                            if hasattr(step_job, "component"):
-                                if isinstance(step_job.component, str):
-                                    comp_name = step_job.component
-                                elif hasattr(step_job.component, "name"):
-                                    comp_name = step_job.component.name
-                            print(
-                                f"    - Step: {step_name} (Display: {step_job.display_name}, Comp: {comp_name}, Compute: {step_job.compute}, Tags: {step_job.tags})"
-                            )
-                    elif isinstance(job_to_submit, _CommandJob):
-                        print(f"  Command: {job_to_submit.command}")
-                        print(f"  Compute: {job_to_submit.compute}")
-                    print("--- END DRY RUN ---")
-                    submitted_count += 1
-                    job_map[original_identifier] = (
-                        f"<Dry Run - {type(job_to_submit).__name__}>"
-                    )
-                else:
-                    # --- Actual Submission ---
-                    try:
-                        print("   Submitting replay job/pipeline...")
-                        created_job = client.jobs.create_or_update(job_to_submit)
-                        print(
-                            f"   ✔ Submitted: {created_job.name} (Type: {created_job.type}) for original: {original_identifier}"
-                        )
-                        submitted_count += 1
-                        job_map[original_identifier] = created_job.name
-                    except HttpResponseError as http_err:
-                        print(
-                            f"\n   ❌ HTTP Error submitting job for original {original_identifier}: Status Code {http_err.status_code}"
-                        )
-                        print(f"      Reason: {http_err.reason}")
-                        # Attempt to extract more details from the error response body
-                        error_details = "No additional details found in error object."
-                        if http_err.error:
-                            # Attempt to access common error structures
-                            code = getattr(http_err.error, "code", "N/A")
-                            message = getattr(
-                                http_err.error, "message", str(http_err)
-                            )  # Fallback to basic message
-                            error_details = f"Service Error Code: {code}\n      Service Message: {message}"
-                        elif hasattr(http_err, "message"):
-                            # Sometimes the message attribute has the core info
-                            error_details = f"Error Message: {http_err.message}"
-
-                        print(f"      {error_details}")
-                        # Log the full error object to the debug log file for deeper inspection
-                        # logger.debug(f"Full HttpResponseError object for {original_identifier}:", exc_info=True) # exc_info adds traceback
-                        # Or just log the raw response if available
-                        if hasattr(http_err, "response") and hasattr(
-                            http_err.response, "text"
-                        ):
-                            print(
-                                "      (Check log file for full response body if DEBUG logging is enabled)"
-                            )
-                            # logger.debug(f"Raw error response body for {original_identifier}: {http_err.response.text}")
-
-                        print("      Recommendations:")
-                        print(
-                            "        - Check the Azure Portal Activity Log for the target resource group around this time."
-                        )
-                        print(
-                            "        - Verify Azure Policies assigned to the target scope (workspace, RG, subscription)."
-                        )
-                        print(
-                            "        - Double-check for any Deny Assignments in IAM for the target scope."
-                        )
-                        print(
-                            "        - Ensure network connectivity if target workspace has network restrictions."
-                        )
-
-                        failed_count += 1
-                    except Exception as submit_error:
-                        print(
-                            f"\n   ❌ Unexpected Error submitting job for original {original_identifier}: {submit_error}"
-                        )
-                        failed_count += 1
             else:
-                print(
-                    f"   No valid job object was generated for {original_identifier}. Skipping submission."
-                )
+                print(f" -> Unknown unit type '{unit_type}'. Skipping.")
+                skipped_count += 1
+                continue
+        except Exception as build_error:
+            print(
+                f"   ❌ Error building job object for original {original_identifier}: {build_error}"
+            )
+            failed_count += 1
+            job_to_submit = None
 
-        finally:
-            # --- Clean up temporary files/directories AFTER attempt ---
-            if temp_metrics_filepath_standalone and os.path.exists(
-                temp_metrics_filepath_standalone
-            ):
-                try:
-                    os.remove(temp_metrics_filepath_standalone)
-                    # logger.debug(f"Cleaned up temp file: {temp_metrics_filepath_standalone}")
-                except OSError as e:
-                    print(
-                        f"Warning: Failed to delete temp file {temp_metrics_filepath_standalone}: {e}"
+        # Submit or dry run
+        if job_to_submit is None:
+            print(
+                f"   No valid job object was generated for {original_identifier}. Skipping submission."
+            )
+        else:
+            if args.dry_run:
+                print(f"\n--- DRY RUN for Original Unit: {original_identifier} ---")
+                local_path_info = (
+                    temp_metrics_filepath_standalone
+                    if temp_metrics_filepath_standalone
+                    else (
+                        f"(Files in {temp_pipeline_dir_path})"
+                        if temp_pipeline_dir_path
+                        else "N/A"
                     )
-            if temp_pipeline_dir_path and os.path.isdir(
-                temp_pipeline_dir_path
-            ):  # Check if it's a directory
+                )
+                print(f"  Metrics File Input Path(s) (LOCAL): {local_path_info}")
+                print(f"  Would submit Job Type: {type(job_to_submit).__name__}")
+                print(f"  Display Name: {job_to_submit.display_name}")
+                print(f"  Experiment Name: {job_to_submit.experiment_name}")
+                print(f"  Tags: {job_to_submit.tags}")
+                env_id = None
+                from azure.ai.ml.entities import CommandJob as _CommandJob
+
+                if isinstance(job_to_submit, _CommandJob):
+                    env_id = job_to_submit.environment
+                elif isinstance(job_to_submit, PipelineJob) and job_to_submit.jobs:
+                    first_step_key = next(iter(job_to_submit.jobs))
+                    env_id = job_to_submit.jobs[first_step_key].environment
+                print(f"  Environment: {env_id}")
+                if isinstance(job_to_submit, PipelineJob):
+                    print(f"  Pipeline Steps ({len(job_to_submit.jobs)}):")
+                    for step_name, step_job in job_to_submit.jobs.items():
+                        comp_name = "N/A"
+                        if hasattr(step_job, "component"):
+                            if isinstance(step_job.component, str):
+                                comp_name = step_job.component
+                            elif hasattr(step_job.component, "name"):
+                                comp_name = step_job.component.name
+                        print(
+                            f"    - Step: {step_name} (Display: {step_job.display_name}, Comp: {comp_name}, Compute: {step_job.compute}, Tags: {step_job.tags})"
+                        )
+                elif isinstance(job_to_submit, _CommandJob):
+                    print(f"  Command: {job_to_submit.command}")
+                    print(f"  Compute: {job_to_submit.compute}")
+                print("--- END DRY RUN ---")
+                submitted_count += 1
+                job_map[original_identifier] = (
+                    f"<Dry Run - {type(job_to_submit).__name__}>"
+                )
+            else:
                 try:
-                    shutil.rmtree(
-                        temp_pipeline_dir_path
-                    )  # Use shutil.rmtree for directories
-                    # logger.debug(f"Cleaned up temp directory: {temp_pipeline_dir_path}")
-                except OSError as e:
+                    print("   Submitting replay job/pipeline...")
+                    created_job = client.jobs.create_or_update(job_to_submit)
                     print(
-                        f"Warning: Failed to delete temp directory {temp_pipeline_dir_path}: {e}"
+                        f"   ✔ Submitted: {created_job.name} (Type: {created_job.type}) for original: {original_identifier}"
                     )
+                    submitted_count += 1
+                    job_map[original_identifier] = created_job.name
+                except HttpResponseError as http_err:
+                    print(
+                        f"\n   ❌ HTTP Error submitting job for original {original_identifier}: Status Code {http_err.status_code}"
+                    )
+                    print(f"      Reason: {http_err.reason}")
+                    failed_count += 1
+                except Exception as submit_error:
+                    print(
+                        f"\n   ❌ Unexpected Error submitting job for original {original_identifier}: {submit_error}"
+                    )
+                    failed_count += 1
+
+        # Cleanup
+        if temp_metrics_filepath_standalone and os.path.exists(
+            temp_metrics_filepath_standalone
+        ):
+            try:
+                os.remove(temp_metrics_filepath_standalone)
+            except OSError as e:
+                print(
+                    f"Warning: Failed to delete temp file {temp_metrics_filepath_standalone}: {e}"
+                )
+        if temp_pipeline_dir_path and os.path.isdir(temp_pipeline_dir_path):
+            try:
+                shutil.rmtree(temp_pipeline_dir_path)
+            except OSError as e:
+                print(
+                    f"Warning: Failed to delete temp directory {temp_pipeline_dir_path}: {e}"
+                )
 
     # --- Final Summary ---
     print("\n--- Replay Summary ---")
@@ -543,6 +677,31 @@ if __name__ == "__main__":
         default=None,  # Default is no limit
         help="Limit the number of original execution units (pipelines/standalone jobs) to process for testing.",
     )
+    parser.add_argument(
+        "--expand-automl-trials",
+        action="store_true",
+        help="Expand AutoML parent steps into individual trial steps in replay pipelines.",
+    )
+    parser.add_argument(
+        "--replay-automl-max-trials",
+        type=int,
+        default=None,
+        help="Cap number of AutoML trials per expanded AutoML parent during replay.",
+    )
+    parser.add_argument(
+        "--replay-automl-top-metric",
+        type=str,
+        default=None,
+        help="Primary metric name for ordering AutoML trials when sampling (replay). If omitted, inferred from first numeric metric.",
+    )
+    parser.add_argument(
+        "--replay-automl-trial-sampling",
+        type=str,
+        choices=["best", "first", "random"],
+        default="best",
+        help="Sampling strategy when selecting AutoML trials for replay expansion.",
+    )
+    # Removed deprecated --keep-automl-parent-step: parent always retained when expanding trials.
     args = parser.parse_args()
 
     main(args)
