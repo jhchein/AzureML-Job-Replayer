@@ -35,6 +35,7 @@ You may want to:
 - ✅ Selective export via include list/file of top-level job names (NEW)
 - ✅ Dry-run mode for safe validation
 - ✅ Recursive traversal of all pipeline descendants
+- ✅ AutoML job replay with trial expansion (parent + ranked trial steps)
 
 ---
 
@@ -149,6 +150,49 @@ Options:
 
 - `--limit`: Limit number of original execution units replayed (pipelines or standalone jobs)
 - `--dry-run`: Build locally without submitting
+- `--expand-automl-trials`: Expand AutoML parent jobs into individual trial steps (always keeps the parent step)
+- `--replay-automl-max-trials N`: Cap number of trials included per AutoML parent (after ordering)
+- `--replay-automl-top-metric METRIC_NAME`: Primary metric used to rank trials when sampling strategy is `best`; if omitted a numeric metric is inferred from the first trial with metrics
+- `--replay-automl-trial-sampling {best|first|random}`: Trial ordering / selection strategy (default: `best`)
+
+AutoML Behavior:
+
+- When `--expand-automl-trials` is set, every eligible AutoML job is represented by:
+  - One parent step (always retained)
+  - A set of trial steps (ranked, truncated by `--replay-automl-max-trials` if provided)
+- Ranking defaults to descending primary metric value (higher-is-better heuristic). If no numeric metric is found, order falls back to original traversal order.
+- Trial rank 1 is tagged as the best trial (`automl_best_trial=true`).
+- Standalone (non-pipeline) AutoML jobs are promoted to a synthetic pipeline for expansion.
+
+Step Naming Pattern:
+
+- Parent: `automl_parent_<first8charsOfOriginalId>` → display name `replay_automl_parent_<original_display_name>`
+- Trials: `automl_trial_<rank(3digits)>_<first8charsOfOriginalId>` → display name `replay_automl_trial_<rank>_<original_display_name>`
+
+Key Tags Added During AutoML Expansion:
+
+| Tag                            | Applied To                               | Meaning                                              |
+| ------------------------------ | ---------------------------------------- | ---------------------------------------------------- |
+| `automl_role`                  | parent + trials                          | `automl_parent` or `automl_trial`                    |
+| `expanded_automl_trial=true`   | parent + trials                          | Marks inclusion due to expansion                     |
+| `automl_total_trials`          | parent                                   | Total candidate trials discovered (leaf descendants) |
+| `automl_expanded_trials_count` | parent                                   | Number of trials actually replayed (post cap)        |
+| `automl_trial_rank`            | trials                                   | 1-based rank (ordering context)                      |
+| `automl_best_trial=true`       | rank 1 trial                             | Denotes top-ranked trial                             |
+| `automl_parent_id`             | trials                                   | Original AutoML parent job ID                        |
+| `automl_metric_primary`        | parent (when metric explicitly provided) | Primary ordering metric                              |
+
+Filtering / Query Examples (AzureML Studio or SDK after replay):
+
+- Find all replayed AutoML parent steps: filter tag `automl_role = automl_parent`
+- List best trials: filter `automl_best_trial = true`
+- Group trials by original parent: filter on `automl_parent_id = <job_id>`
+
+Notes:
+
+- The expansion does not reproduce original HyperDrive orchestration semantics; it recreates structure + metrics only.
+- If you need deterministic selection across runs, avoid `--replay-automl-trial-sampling random`.
+- If `--replay-automl-top-metric` is omitted and multiple numeric metrics exist, the first encountered numeric metric is used (heuristic).
 
 ---
 
