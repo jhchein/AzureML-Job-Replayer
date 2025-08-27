@@ -177,3 +177,5 @@ config/*.json
 data/*.json
 logs/*.log
 .vscode/
+*.txt
+todos.md
