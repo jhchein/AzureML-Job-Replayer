@@ -179,3 +179,4 @@ logs/*.log
 .vscode/
 *.txt
 todos.md
+data/*
