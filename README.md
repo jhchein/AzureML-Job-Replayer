@@ -9,66 +9,52 @@ Replay (migrate) AzureML jobs from a SOURCE workspace into a TARGET workspace �
 
 ---
 
-## 🔑 TL;DR Quickstart (Migration)
+## 🔑 TL;DR Quickstart (Migration – Always Two Steps)
 
-Minimal end‑to‑end migration (extract + replay) from one workspace into another:
+Minimal migration = extract locally, then replay from that JSON:
 
-```powershell
-az login
-# (Optional) If you have multiple subscriptions and need a specific one:
-# az account set --subscription <SOURCE_SUBSCRIPTION_ID>
-
-pip install -r requirements.txt
-
-# Two configs pointing at DIFFERENT workspaces
-#  config/source_config.json  -> origin
-#  config/target_config.json  -> destination
-python main.py --source config/source_config.json --target config/target_config.json
-```
-
-Need a safety pass first?
+- Setup config files (see `config` dir)
+- (Optional) Create a txt file containing all to be extracted job names (e.g. `include.txt`, newline separated).
+- Run the following:
 
 ```powershell
-python main.py --source config/source_config.json --target config/target_config.json --dry-run
-```
+az login # (optional: --tenant <tenantid Source>
 
-> For cross‑tenant moves see [Cross‑Tenant Migration (A → B)](#cross-tenant-migration).
+pip install -r requirements.txt  # or: uv install
+
+# Extract from SOURCE workspace
+python -m extractor.extract_jobs --source config/source_config.json --output data/jobs.json
+
+# (Optional) Inspect data/jobs.json (or create a subset)
+
+# (Optional) `az login --tenant <tenantid Target>`
+
+# Dry-Run
+python -m replayer.build_pipeline --input data/jobs.json --target config/target_config.json --dry-run
+
+# 2) Replay into TARGET workspace
+python -m replayer.build_pipeline --input data/jobs.json --target config/target_config.json
+```
 
 ---
 
-## 🚀 Usage Patterns (Choose Your Flow)
+## 🚀 Usage Patterns
 
-### 1. One‑Shot Migration (fast path)
-
-Use when you just want everything migrated now.
+Limit how many top‑level jobs you migrate:
 
 ```powershell
-python main.py --source config/source_config.json --target config/target_config.json
+python -m extractor.extract_jobs --source config/source_config.json --output data/jobs.json --limit 5
+python -m replayer.build_pipeline --input data/jobs.json --target config/target_config.json --limit 5
 ```
 
-Add sampling or safety:
+Filter job names via include file (newline separated):
 
 ```powershell
-python main.py --source ... --target ... --limit 5      # only first 5 top-level units
-python main.py --source ... --target ... --dry-run      # extract + validate only
-```
-
-### 2. Two‑Phase (Review / Subset / Cross‑Tenant)
-
-Use when you must inspect, filter, or hand JSON across tenants.
-
-```powershell
-python -m extractor.extract_jobs --source config/source_config.json --output data/jobs.json
-# (Optionally restrict:)
-python -m extractor.extract_jobs --source config/source_config.json --output data/selected.json --include-file job_names.txt
-# Replay later (maybe on another tenant / subscription)
-python -m replayer.build_pipeline --input data/selected.json --target config/target_config.json --dry-run
+python -m extractor.extract_jobs --source config/source_config.json --include-file job_names.txt --output data/selected.json
 python -m replayer.build_pipeline --input data/selected.json --target config/target_config.json
 ```
 
-### 3. AutoML Trial Expansion
-
-Only when you specifically need trial‑level synthetic runs.
+Expand AutoML trials (only if you need trial‑level metrics, logs, and artifacts):
 
 ```powershell
 python -m replayer.build_pipeline \
@@ -83,42 +69,29 @@ python -m replayer.build_pipeline \
 
 ## 🧩 What It Does (Short)
 
-1. Extracts jobs (standalone + nested pipeline hierarchy) to a JSON file (metadata + MLflow metrics/params/tags).
-2. Rebuilds lightweight dummy jobs/pipelines in a target workspace that log the historical metrics and keep lineage via tags.
-3. Optionally expands AutoML jobs into parent + ranked trial steps.
-4. (Now optional) Copies original MLflow artifacts for each run and re-logs them in replay jobs.
+1. Extracts jobs (standalone + nested pipeline steps) to JSON (metadata + MLflow metrics/params/tags).
+2. Rebuilds lightweight “replay” jobs/pipelines that log the original metrics and lineage tags.
+3. (Optional) Expands AutoML parents into selected trial steps.
+4. Copies run artifacts/logs and re-uploads them under the new run (namespaced to avoid collisions).
 
-No original code/compute rerun. Artifacts are copied unless disabled.
+No original training/inference is re-executed.
 
 ---
 
 ## ✨ Key Features
 
-- Cross‑workspace migration (primary use case)
-- Nested pipeline replay (any depth)
-- Standalone jobs replay
-- Selective export via include list/file
-- AutoML trial expansion with ranking & caps
-- Full MLflow artifact copy & re-upload (on by default)
-- Dry‑run / limit flags for safe sampling
-- (Optional) same‑workspace “snapshot” mode
-
----
-
-## 🔧 Installation & Auth
-
-Requires Python 3.9+ and Azure CLI login.
-
-```powershell
-az login
-pip install -r requirements.txt    # or: uv install
-```
+- Cross‑workspace replay / migration
+- Nested pipeline hierarchy reconstruction
+- Selective export (include list / file / limit)
+- AutoML trial expansion (ranking + sampling)
+- Full artifact + log copy (on by default)
+- Dry‑run safety mode
 
 ---
 
 ## 🗂 Config Files
 
-Create `config/source_config.json` and `config/target_config.json` (copy from the `.example` files):
+Create `config/source_config.json` and `config/target_config.json` (copy the `.example` files):
 
 ```jsonc
 {
@@ -126,46 +99,6 @@ Create `config/source_config.json` and `config/target_config.json` (copy from th
   "resource_group": "<RESOURCE_GROUP>",
   "workspace_name": "<WORKSPACE_NAME>"
 }
-```
-
-They should normally point to DIFFERENT workspaces (migration / consolidation / cross‑tenant).  
-Only set them equal if you deliberately want an in‑place synthetic replay for analysis.
-
----
-
-## 🔍 Common Scenarios
-
-| Goal                            | Command (summary)                                    | Why this path          |
-| ------------------------------- | ---------------------------------------------------- | ---------------------- |
-| Full migration                  | `python main.py --source ... --target ...`           | Fast, simplest         |
-| Sample first N units            | `python main.py --source ... --target ... --limit 5` | Quick sanity check     |
-| Curated subset                  | Extract with `--include/--include-file`, then replay | Control scope          |
-| Cross‑tenant                    | Two‑phase + re‑login (see section below)             | Separate auth contexts |
-| Audit before replay             | Two‑phase flow, inspect `data/jobs.json`             | Governance             |
-| AutoML trials as steps          | Replay with `--expand-automl-trials`                 | Deeper comparison      |
-| Validate infra only (no submit) | Add `--dry-run`                                      | Safe dry run           |
-| In‑place snapshot (optional)    | Same config for source & target                      | Metric reconstruction  |
-
----
-
-<h2 id="cross-tenant-migration">🌐 Cross‑Tenant Migration (A → B)</h2>
-
-1. Login to Tenant A, extract.
-2. Login to Tenant B, replay the saved JSON.
-
-```powershell
-# Tenant A
-az logout
-az login --tenant <TENANT_A_ID>
-az account set --subscription <SOURCE_SUBSCRIPTION_ID>
-python -m extractor.extract_jobs --source config/source_config.json --output data/source_jobs.json [--include-file job_names.txt]
-
-# Tenant B
-az logout
-az login --tenant <TENANT_B_ID>
-az account set --subscription <TARGET_SUBSCRIPTION_ID>
-python -m replayer.build_pipeline --input data/source_jobs.json --target config/target_config.json --dry-run
-python -m replayer.build_pipeline --input data/source_jobs.json --target config/target_config.json
 ```
 
 ---
@@ -196,16 +129,6 @@ When `--expand-automl-trials` is used:
 | `--include-file PATH`   | File with one job name per line                         | (none)                      |
 | `--limit N`             | After filtering, cap number of top-level roots exported | (no cap)                    |
 
-### One‑Shot (`python main.py`)
-
-| Flag            | Description                          | Default                     |
-| --------------- | ------------------------------------ | --------------------------- |
-| `--source PATH` | Source config                        | `config/source_config.json` |
-| `--target PATH` | Target config                        | `config/target_config.json` |
-| `--limit N`     | Limit top-level replay units         | (no cap)                    |
-| `--dry-run`     | Extract + validate; skip submissions | off                         |
-| `--output FILE` | Extraction JSON path                 | `data/jobs.json`            |
-
 ### Replay (`python -m replayer.build_pipeline`)
 
 | Flag                                                 | Description                  | Default                     |
@@ -221,53 +144,43 @@ When `--expand-automl-trials` is used:
 
 ---
 
-## 📦 What Is / Isn’t Reproduced
+## 📦 Reproduced vs Skipped
 
-| Category                           | Replayed         | Notes                                                       |
-| ---------------------------------- | ---------------- | ----------------------------------------------------------- |
-| Job hierarchy (pipelines, nesting) | ✅               | Parent/child via synthetic pipeline steps                   |
-| Metrics / params / tags (MLflow)   | ✅               | Logged into dummy steps                                     |
-| Timestamps (created/start/end)     | ✅               | Stored in metadata JSON (not re-applied as real start time) |
-| Original command, env references   | ✅ (metadata)    | For inspection only                                         |
-| AutoML structure (parent + trials) | ✅ (optional)    | With ranking tags                                           |
-| Artifacts / model files            | ❌               | Future roadmap                                              |
-| Logs (stdout/stderr)               | ❌               | Future roadmap                                              |
-| Dataset/Data asset registrations   | ❌               | Not recreated                                               |
-| Exact environment or compute       | ❌ (best-effort) | Dummy env + `serverless` default                            |
-| Pipeline IO edges                  | ❌               | Not yet implemented                                         |
+| Category                          | Replayed  | Notes                             |
+| --------------------------------- | --------- | --------------------------------- |
+| Pipeline / job hierarchy          | ✅        | Synthetic pipeline & step mapping |
+| Metrics / params / tags           | ✅        | Logged via MLflow                 |
+| Timestamps                        | ✅        | Stored in JSON (not re-applied)   |
+| Commands / env refs               | ✅ (meta) | For inspection only               |
+| AutoML structure                  | ✅ (opt)  | Parent + ranked trials            |
+| Artifacts / models                | ✅        | Uploaded under run outputs        |
+| Logs                              | ✅        | Namespaced to avoid collisions    |
+| Registered datasets / data assets | ❌        | Not recreated                     |
 
 ---
 
 ## 🛠 Troubleshooting
 
-| Symptom                        | Likely Cause                | Fix                                         |
-| ------------------------------ | --------------------------- | ------------------------------------------- |
-| `ModuleNotFoundError: azureml` | Dependencies missing        | `pip install -r requirements.txt`           |
-| Auth / 401 / 403               | Wrong subscription / RBAC   | `az account show`, re-login, check role     |
-| Job names skipped              | Typos / case mismatch       | Verify in Studio / `--include-file` entries |
-| Missing metrics in replay      | Original job had none       | Expected; check source run in MLflow        |
-| Fewer jobs than expected       | `--limit` or include filter | Remove filters                              |
+Detailed logs: `logs/extract_jobs_*.log`, `logs/replayer_*.log`.
 
-Detailed logs: `logs/extract_jobs_*.log` and `logs/replayer_*.log`.
+If expected artifacts appear “empty”, verify identity-based access and that the run shows the `replayed_artifacts` folder. For missing jobs, check naming (case-sensitive includes) and filters (`--limit`).
 
 ---
 
-## 🧱 Architecture (High Level)
+## 🧱 Architecture
 
-1. Extractor builds a flat JSON list of `JobMetadata` (one per job/step).
-2. Replay indexes by name, reconstructs parent→children, groups top-level units.
-3. Each replayed step = a minimal command component that loads a metrics JSON and logs values.
-4. Lineage & mapping preserved via tags (`original_job_id`, `replay_type`, AutoML tags, etc.).
+1. Extract → flatten job & step metadata into JSON.
+2. Replay → rebuild unit graph (top-level pipelines & standalone jobs).
+3. Dummy component → copies original outputs, uploads filtered artifacts, logs metrics.
+4. Lineage preserved via tags (`original_job_id`, etc.).
 
 ---
 
 ## 🗺 Roadmap
 
-- Artifact copy (models / outputs)
-- Log (stdout/stderr) harvesting
-- Pipeline input/output edge recreation
-- Additional filters (date range, tag selectors, depth)
-- Deterministic environment & compute recreation options
+- Unified CLI surface (single entry with subcommands)
+- Additional filters (dates, tags, depth)
+- Optional dataset re-registration
 
 ---
 
@@ -277,7 +190,7 @@ MIT
 
 ## 🤝 Contributing
 
-Fork → branch → PR. Small focused changes appreciated (docs, tests, features behind flags).
+PRs welcome (docs, tests, small focused flags).
 
 ## ❓ Help
 
