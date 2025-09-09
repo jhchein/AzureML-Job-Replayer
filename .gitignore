@@ -180,3 +180,4 @@ logs/*.log
 *.txt
 todos.md
 data/*
+artifacts_export/*

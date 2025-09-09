@@ -104,6 +104,9 @@ def build_dummy_pipeline_for_children(
     replay_automl_max_trials: Optional[int] = None,
     replay_automl_top_metric: Optional[str] = None,
     replay_automl_trial_sampling: str = "best",  # best|first|random
+    artifacts_dir: Optional[str] = None,
+    upload_artifacts: bool = True,
+    include_trial_artifacts: bool = False,
 ) -> Optional[PipelineJob]:
     if not child_jobs:
         return None
@@ -263,10 +266,23 @@ def build_dummy_pipeline_for_children(
             print(f"ERROR: Failed to write temp metrics file {temp_filepath}: {e}")
             continue
 
-        step = replay_metrics_component(
+        step_inputs = dict(
             original_job_id=step_job_meta.name,
             metrics_file=Input(type=AssetTypes.URI_FILE, path=temp_filepath),
         )
+        # Attach artifacts if enabled
+        if upload_artifacts and artifacts_dir:
+            # Determine if this is an automl trial and whether it's included
+            is_trial = step_info["role"] == "automl_trial"
+            if (not is_trial) or (is_trial and include_trial_artifacts):
+                run_artifacts_path = os.path.join(artifacts_dir, step_job_meta.name)
+                if os.path.isdir(run_artifacts_path):
+                    step_inputs["artifacts_dir"] = Input(
+                        type=AssetTypes.URI_FOLDER, path=run_artifacts_path
+                    )
+                elif is_trial and not include_trial_artifacts:
+                    pass
+        step = replay_metrics_component(**step_inputs)
 
         # Naming strategy
         base_display = step_job_meta.display_name or step_job_meta.name
@@ -344,16 +360,24 @@ def build_dummy_pipeline_for_children(
 def build_dummy_standalone_job(
     original_job: JobMetadata,
     metrics_file_path: str,
+    *,
+    artifacts_dir: Optional[str] = None,
+    upload_artifacts: bool = True,
 ):
     """
     Builds a dummy CommandJob using a pre-existing metrics file path.
     """
     # Metrics file is already created by the caller
 
-    job = replay_metrics_component(
+    inputs = dict(
         original_job_id=original_job.name,
         metrics_file=Input(type=AssetTypes.URI_FILE, path=metrics_file_path),
     )
+    if upload_artifacts and artifacts_dir:
+        run_dir = os.path.join(artifacts_dir, original_job.name)
+        if os.path.isdir(run_dir):
+            inputs["artifacts_dir"] = Input(type=AssetTypes.URI_FOLDER, path=run_dir)
+    job = replay_metrics_component(**inputs)
 
     # Apply runtime settings
     job.display_name = f"Replay of {original_job.display_name or original_job.name}"
@@ -502,7 +526,10 @@ def main(args):
                     temp_metrics_filepath_standalone = temp_f.name
                     temp_f.write(metrics_json_str)
                 job_to_submit = build_dummy_standalone_job(
-                    original_job_metadata, temp_metrics_filepath_standalone
+                    original_job_metadata,
+                    temp_metrics_filepath_standalone,
+                    artifacts_dir=args.artifacts_dir,
+                    upload_artifacts=not args.no_artifacts,
                 )
             elif unit_type == "pipeline":
                 parent_meta = jm
@@ -522,6 +549,9 @@ def main(args):
                         replay_automl_max_trials=args.replay_automl_max_trials,
                         replay_automl_top_metric=args.replay_automl_top_metric,
                         replay_automl_trial_sampling=args.replay_automl_trial_sampling,
+                        artifacts_dir=args.artifacts_dir,
+                        upload_artifacts=not args.no_artifacts,
+                        include_trial_artifacts=args.include_trial_artifacts,
                     )
                     if job_to_submit is None:
                         print(
@@ -536,7 +566,10 @@ def main(args):
                         temp_metrics_filepath_standalone = temp_f.name
                         temp_f.write(metrics_json_str)
                     job_to_submit = build_dummy_standalone_job(
-                        parent_meta, temp_metrics_filepath_standalone
+                        parent_meta,
+                        temp_metrics_filepath_standalone,
+                        artifacts_dir=args.artifacts_dir,
+                        upload_artifacts=not args.no_artifacts,
                     )
             else:
                 print(f" -> Unknown unit type '{unit_type}'. Skipping.")
@@ -700,6 +733,22 @@ if __name__ == "__main__":
         choices=["best", "first", "random"],
         default="best",
         help="Sampling strategy when selecting AutoML trials for replay expansion.",
+    )
+    parser.add_argument(
+        "--no-artifacts",
+        action="store_true",
+        help="Do not upload/log artifacts for runs (artifacts are uploaded by default).",
+    )
+    parser.add_argument(
+        "--artifacts-dir",
+        type=str,
+        default="artifacts_export",
+        help="Directory root containing per-run artifact folders from extraction phase.",
+    )
+    parser.add_argument(
+        "--include-trial-artifacts",
+        action="store_true",
+        help="Upload artifacts for AutoML trial runs when trials are expanded (default: only parent/non-trial).",
     )
     # Removed deprecated --keep-automl-parent-step: parent always retained when expanding trials.
     args = parser.parse_args()

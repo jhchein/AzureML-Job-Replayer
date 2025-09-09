@@ -26,8 +26,9 @@ replay_metrics_component = command(
     inputs={
         "original_job_id": "string",
         "metrics_file": Input(type=AssetTypes.URI_FILE),
+        "artifacts_dir": Input(type=AssetTypes.URI_FOLDER, optional=True),
     },
     code="./replayer/component_code",
-    command='python log_metrics.py --job-id "${{inputs.original_job_id}}" --metrics-file ${{inputs.metrics_file}}',
+    command='python log_metrics.py --job-id "${{inputs.original_job_id}}" --metrics-file ${{inputs.metrics_file}} --artifacts-dir ${{inputs.artifacts_dir}}',
     environment=REGISTERED_ENV_ID,
 )

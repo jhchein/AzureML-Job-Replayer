@@ -79,10 +79,6 @@ python -m replayer.build_pipeline \
   --replay-automl-trial-sampling best
 ```
 
-### 4. (Optional) In‑Place Snapshot
-
-Point source & target to the same workspace purely to materialize historical metrics as fresh synthetic runs (analysis / demo). Not for migration.
-
 ---
 
 ## 🧩 What It Does (Short)
@@ -90,8 +86,9 @@ Point source & target to the same workspace purely to materialize historical met
 1. Extracts jobs (standalone + nested pipeline hierarchy) to a JSON file (metadata + MLflow metrics/params/tags).
 2. Rebuilds lightweight dummy jobs/pipelines in a target workspace that log the historical metrics and keep lineage via tags.
 3. Optionally expands AutoML jobs into parent + ranked trial steps.
+4. (Now optional) Copies original MLflow artifacts for each run and re-logs them in replay jobs.
 
-No original code/compute rerun. No artifacts copied (yet).
+No original code/compute rerun. Artifacts are copied unless disabled.
 
 ---
 
@@ -102,6 +99,7 @@ No original code/compute rerun. No artifacts copied (yet).
 - Standalone jobs replay
 - Selective export via include list/file
 - AutoML trial expansion with ranking & caps
+- Full MLflow artifact copy & re-upload (on by default)
 - Dry‑run / limit flags for safe sampling
 - (Optional) same‑workspace “snapshot” mode
 
@@ -288,4 +286,4 @@ Fork → branch → PR. Small focused changes appreciated (docs, tests, features
 
 ---
 
-_Happy migrating (and optionally snapshotting)._
+_Happy migrating._

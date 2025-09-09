@@ -237,6 +237,50 @@ def convert_complex_dict(obj: Any) -> Any:
             return f"<Unserializable object: {type(obj).__name__}>"
 
 
+# --- Artifact Download Helper (placed early so available to extraction functions) ---
+def _download_run_artifacts(
+    mlflow_client: MlflowClient,
+    run_id: str,
+    artifacts_root: str,
+    warn_if_exists: bool = True,
+):
+    """Download full artifact tree for a run into artifacts_root/<run_id>.
+    Overwrites existing folder after warning. Logs file count & total bytes. Warn if >200MB.
+    """
+    target_dir = os.path.join(artifacts_root, run_id)
+    try:
+        if os.path.isdir(target_dir):
+            if warn_if_exists:
+                logger.warning(
+                    f"Artifact folder already exists for run {run_id}; overwriting."
+                )
+            import shutil
+
+            shutil.rmtree(target_dir, ignore_errors=True)
+        os.makedirs(target_dir, exist_ok=True)
+        mlflow_client.download_artifacts(run_id, "", target_dir)
+        total_bytes = 0
+        file_count = 0
+        for root, _, files in os.walk(target_dir):
+            for fn in files:
+                fp = os.path.join(root, fn)
+                try:
+                    total_bytes += os.path.getsize(fp)
+                    file_count += 1
+                except OSError:
+                    pass
+        size_mb = total_bytes / (1024 * 1024) if total_bytes else 0
+        logger.info(
+            f"Downloaded artifacts for run {run_id}: {file_count} files, {size_mb:.2f} MB into {target_dir}"
+        )
+        if size_mb > 200:
+            logger.warning(
+                f"Large artifact set for run {run_id}: {size_mb:.2f} MB (threshold 200MB)."
+            )
+    except Exception as e:
+        logger.warning(f"Failed to download artifacts for run {run_id}: {e}")
+
+
 # --- Dataclass Definition ---
 
 
@@ -372,7 +416,11 @@ def _process_job_object(job: Job, mlflow_client: MlflowClient) -> Optional[JobMe
     and returns its JobMetadata.
     Returns None if the job object itself is invalid or causes critical errors.
     """
-    job_name = job.name  # Use the name from the passed Job object
+    # Defensive: ensure job has a name
+    if job.name is None:  # type: ignore[has-type]
+        logger.warning("Job object without a name encountered; skipping.")
+        return None
+    job_name: str = job.name  # Use the name from the passed Job object
     logger.info(f"Processing job object: {job_name} (Type: {job.type})")
 
     # --- MLflow Data Extraction ---
@@ -391,6 +439,7 @@ def _process_job_object(job: Job, mlflow_client: MlflowClient) -> Optional[JobMe
     script_name = None
 
     try:
+        # mlflow_client.get_run expects a str; guard already ensured
         mlflow_run = mlflow_client.get_run(job_name)  # Use job_name which IS the run_id
         if mlflow_run:
             logger.debug(f"Found MLflow run for job {job_name}")
@@ -502,9 +551,12 @@ def _process_job_object(job: Job, mlflow_client: MlflowClient) -> Optional[JobMe
     # Resources
     instance_count = None
     instance_type = None
-    if hasattr(job, "resources"):
-        instance_count = getattr(job.resources, "instance_count", None)
-        instance_type = getattr(job.resources, "instance_type", None)
+    resources_obj = (
+        getattr(job, "resources", None) if hasattr(job, "resources") else None
+    )
+    if resources_obj is not None:
+        instance_count = getattr(resources_obj, "instance_count", None)
+        instance_type = getattr(resources_obj, "instance_type", None)
 
     # Creation / Modification Context
     created_at_dt = (
@@ -635,6 +687,9 @@ def extract_all_jobs(
     automl_top_metric: Optional[str] = None,
     automl_trial_sampling: str = "best",  # best|first|random
     automl_include_trials: bool = True,
+    download_artifacts: bool = True,
+    include_trial_artifacts: bool = False,
+    artifacts_dir: str = "artifacts_export",
 ) -> Iterator[JobMetadata]:
     """
     Extract selected top-level jobs (optionally restricted by include_names)
@@ -645,11 +700,15 @@ def extract_all_jobs(
         If provided, only top-level jobs whose name is in this set are processed.
         Their descendants are still fully traversed.
     """
-    mlflow_tracking_uri = client.workspaces.get(
-        client.workspace_name
-    ).mlflow_tracking_uri
-    logger.info(f"Using MLflow tracking URI: {mlflow_tracking_uri}")
-    mlflow.set_tracking_uri(mlflow_tracking_uri)
+    ws_obj = client.workspaces.get(client.workspace_name)
+    mlflow_tracking_uri = getattr(ws_obj, "mlflow_tracking_uri", None)
+    if mlflow_tracking_uri:
+        logger.info(f"Using MLflow tracking URI: {mlflow_tracking_uri}")
+        mlflow.set_tracking_uri(mlflow_tracking_uri)  # type: ignore[arg-type]
+    else:
+        logger.warning(
+            "Workspace has no mlflow_tracking_uri; proceeding without MLflow tracking URI override."
+        )
     mlflow_client = MlflowClient()
 
     try:
@@ -694,11 +753,14 @@ def extract_all_jobs(
     for job_summary in tqdm(
         job_summaries_to_process, desc="Processing Top-Level Jobs", unit="job"
     ):
-        root_job_name = job_summary.name
+        root_job_name = job_summary.name  # SDK should always provide a name
+        if root_job_name is None:  # Defensive
+            logger.warning("Encountered a job summary without a name; skipping.")
+            continue
         if root_job_name in visited:
             continue
         try:
-            root_job_object: Job = client.jobs.get(name=root_job_name)
+            root_job_object: Job = client.jobs.get(name=root_job_name)  # type: ignore[arg-type]
         except ResourceNotFoundError:
             logger.warning(
                 f"Top-level job {root_job_name} summary found but GET failed (not found). Skipping."
@@ -718,6 +780,15 @@ def extract_all_jobs(
         visited.add(root_job_name)
         yield root_metadata
 
+        # Download artifacts for root (always attempt if enabled)
+        if download_artifacts:
+            _download_run_artifacts(
+                mlflow_client,
+                run_id=root_job_name,
+                artifacts_root=artifacts_dir,
+                warn_if_exists=True,
+            )
+
         # Always traverse descendants (not only pipelines) to capture AutoML / Sweep / nested structures
         yield from _traverse_descendants(
             client=client,
@@ -728,6 +799,9 @@ def extract_all_jobs(
             automl_top_metric=automl_top_metric,
             automl_trial_sampling=automl_trial_sampling,
             automl_include_trials=automl_include_trials,
+            download_artifacts=download_artifacts,
+            include_trial_artifacts=include_trial_artifacts,
+            artifacts_dir=artifacts_dir,
         )
 
 
@@ -740,6 +814,9 @@ def _traverse_descendants(
     automl_top_metric: Optional[str],
     automl_trial_sampling: str,
     automl_include_trials: bool,
+    download_artifacts: bool,
+    include_trial_artifacts: bool,
+    artifacts_dir: str,
 ) -> Iterator[JobMetadata]:
     """Generic depth-first traversal of all descendant jobs (pipelines, AutoML, sweeps, etc.)."""
     stack: List[str] = [root_name]
@@ -775,6 +852,11 @@ def _traverse_descendants(
         processed_children: List[JobMetadata] = []
         for child_summary in child_job_summaries:
             child_name = child_summary.name
+            if child_name is None:
+                logger.warning(
+                    f"Encountered child summary without name under parent {current_parent}; skipping."
+                )
+                continue
             if child_name in visited:
                 continue
             try:
@@ -870,10 +952,28 @@ def _traverse_descendants(
         # Yield children and push each onto stack for further traversal (generic approach)
         for child_metadata in processed_children:
             child_name = child_metadata.name
+            if child_name is None:
+                logger.warning(
+                    f"Child job of parent {current_parent} has no name; skipping."
+                )
+                continue
             if child_name in visited:
                 continue
             visited.add(child_name)
             yield child_metadata
+            # Artifacts: only for trials if include_trial_artifacts, always for non-trial descendants
+            if download_artifacts:
+                is_trial = (
+                    is_automl_parent
+                    and child_metadata.parent_job_name == current_parent
+                )
+                if not is_trial or (is_trial and include_trial_artifacts):
+                    _download_run_artifacts(
+                        mlflow_client,
+                        run_id=child_name,
+                        artifacts_root=artifacts_dir,
+                        warn_if_exists=True,
+                    )
             # Always attempt further traversal (cheap if no children)
             stack.append(child_name)
 
@@ -890,6 +990,9 @@ def main(
     automl_top_metric: Optional[str] = None,
     automl_trial_sampling: str = "best",
     automl_include_trials: bool = True,
+    download_artifacts: bool = True,
+    include_trial_artifacts: bool = False,
+    artifacts_dir: str = "artifacts_export",
 ):
     setup_logging()
     try:
@@ -922,6 +1025,9 @@ def main(
                 automl_top_metric=automl_top_metric,
                 automl_trial_sampling=automl_trial_sampling,
                 automl_include_trials=automl_include_trials,
+                download_artifacts=download_artifacts,
+                include_trial_artifacts=include_trial_artifacts,
+                artifacts_dir=artifacts_dir,
             ):
                 if not first_item:
                     f.write(",\n")
@@ -987,9 +1093,25 @@ if __name__ == "__main__":
         action="store_true",
         help="Exclude AutoML trial child jobs entirely; only export parent AutoML job metadata.",
     )
+    parser.add_argument(
+        "--no-artifacts",
+        action="store_true",
+        help="Skip downloading MLflow artifacts (by default artifacts are downloaded).",
+    )
+    parser.add_argument(
+        "--artifacts-dir",
+        type=str,
+        default="artifacts_export",
+        help="Directory root where run artifact folders will be stored (one subfolder per run id).",
+    )
+    parser.add_argument(
+        "--include-trial-artifacts",
+        action="store_true",
+        help="Also download artifacts for AutoML trial runs (when trials are included).",
+    )
     args = parser.parse_args()
 
-    include_names: Set[str] = set()
+    include_names: Optional[Set[str]] = set()
     if args.include:
         include_names.update(n.strip() for n in args.include.split(",") if n.strip())
     if args.include_file:
@@ -1014,4 +1136,7 @@ if __name__ == "__main__":
         automl_top_metric=args.automl_top_metric,
         automl_trial_sampling=args.automl_trial_sampling,
         automl_include_trials=not args.no_automl_trials,
+        download_artifacts=not args.no_artifacts,
+        include_trial_artifacts=args.include_trial_artifacts,
+        artifacts_dir=args.artifacts_dir,
     )
