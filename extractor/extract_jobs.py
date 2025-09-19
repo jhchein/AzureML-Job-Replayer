@@ -676,13 +676,92 @@ def _process_job_object(job: Job, mlflow_client: MlflowClient) -> Optional[JobMe
     return jm
 
 
+def extract_job_by_name(
+    client: MLClient,
+    job_name: str,
+    automl_max_trials: Optional[int] = None,
+    automl_top_metric: Optional[str] = None,
+    automl_trial_sampling: str = "best",  # best|first|random
+    automl_include_trials: bool = True,
+    download_artifacts: bool = True,
+    include_trial_artifacts: bool = False,
+    artifacts_dir: str = "artifacts_export",
+) -> Iterator[JobMetadata]:
+    """
+    Extract a single top-level job by name
+    AND all its recursively nested child jobs (for pipelines),
+    yielding JobMetadata objects.
+
+    Returns None if the specified job is not found or cannot be processed.
+    """
+    ws_obj = client.workspaces.get(client.workspace_name)
+    mlflow_tracking_uri = getattr(ws_obj, "mlflow_tracking_uri", None)
+    if mlflow_tracking_uri:
+        logger.info(f"Using MLflow tracking URI: {mlflow_tracking_uri}")
+        mlflow.set_tracking_uri(mlflow_tracking_uri)  # type: ignore[arg-type]
+    else:
+        logger.warning(
+            "Workspace has no mlflow_tracking_uri; proceeding without MLflow tracking URI override."
+        )
+    mlflow_client = MlflowClient()
+
+    try:
+        root_job_object: Job = client.jobs.get(name=job_name)  # type: ignore[arg-type]
+    except ResourceNotFoundError:
+        logger.warning(
+            f"Top-level job {job_name} not found in workspace {client.workspace_name}."
+        )
+        return None
+    except Exception as e:
+        logger.error(
+            f"Failed to retrieve full job details for top-level job {job_name}: {e}. Skipping."
+        )
+        return None
+
+    root_metadata = _process_job_object(root_job_object, mlflow_client)
+    if not root_metadata:
+        logger.warning(f"Failed to process top-level job object {job_name}.")
+        return None
+
+    visited: Set[str] = set()
+    visited.add(job_name)
+
+    # Download artifacts for root (always attempt if enabled)
+    if download_artifacts:
+        _download_run_artifacts(
+            mlflow_client,
+            run_id=job_name,
+            artifacts_root=artifacts_dir,
+            warn_if_exists=True,
+        )
+
+    # Always traverse descendants (not only pipelines) to capture AutoML / Sweep / nested structures
+    descendants = _traverse_descendants(
+        client=client,
+        mlflow_client=mlflow_client,
+        root_name=job_name,
+        visited=visited,
+        automl_max_trials=automl_max_trials,
+        automl_top_metric=automl_top_metric,
+        automl_trial_sampling=automl_trial_sampling,
+        automl_include_trials=automl_include_trials,
+        download_artifacts=download_artifacts,
+        include_trial_artifacts=include_trial_artifacts,
+        artifacts_dir=artifacts_dir,
+    )
+
+    # yield root metadata and descendants as a list
+    yield root_metadata
+    yield from descendants
+
+
 def extract_all_jobs(
     client: MLClient,
     limit: Optional[int] = None,
     filter: Optional[
         list[str]
     ] = None,  # (kept for backward compatibility / future use)
-    include_names: Optional[Set[str]] = None,
+    # include_names: Optional[Set[str]] = None,
     automl_max_trials: Optional[int] = None,
     automl_top_metric: Optional[str] = None,
     automl_trial_sampling: str = "best",  # best|first|random
@@ -719,25 +798,10 @@ def extract_all_jobs(
 
     total_jobs = len(all_job_summaries)
 
-    # Apply include_names filter (top-level only)
-    if include_names:
-        name_to_summary = {s.name: s for s in all_job_summaries}
-        missing = [n for n in include_names if n not in name_to_summary]
-        if missing:
-            logger.warning(
-                f"{len(missing)} requested top-level job name(s) not found and will be skipped: {missing}"
-            )
-        filtered_summaries = [
-            name_to_summary[n] for n in include_names if n in name_to_summary
-        ]
-        print(
-            f"Top-level include filter active: {len(filtered_summaries)}/{total_jobs} jobs selected before limit."
-        )
-    else:
-        filtered_summaries = all_job_summaries
-        print(
-            f"Found {total_jobs} total top-level job summaries. Starting extraction including children..."
-        )
+    filtered_summaries = all_job_summaries
+    print(
+        f"Found {total_jobs} total top-level job summaries. Starting extraction including children..."
+    )
 
     # Apply limit AFTER filtering (cap the number of selected roots)
     if limit is not None and limit < len(filtered_summaries):
@@ -1014,28 +1078,67 @@ def main(
 
     job_count = 0
     first_item = True
+    missing_requested: list[str] = []
+
     try:
         with open(output_path, "w", encoding="utf-8") as f:
             f.write("[")
-            for job_metadata in extract_all_jobs(
-                source_client,
-                limit=limit,
-                include_names=include_names,
-                automl_max_trials=automl_max_trials,
-                automl_top_metric=automl_top_metric,
-                automl_trial_sampling=automl_trial_sampling,
-                automl_include_trials=automl_include_trials,
-                download_artifacts=download_artifacts,
-                include_trial_artifacts=include_trial_artifacts,
-                artifacts_dir=artifacts_dir,
-            ):
-                if not first_item:
-                    f.write(",\n")
-                else:
-                    first_item = False
-                f.write(json.dumps(job_metadata.to_dict(), indent=2))
-                job_count += 1
-            f.write("]")
+            if include_names:
+                print(
+                    f"Extracting {len(include_names)} specified top-level job(s) and their descendants..."
+                )
+                for name in include_names:
+                    # Attempt extraction of this explicit job name
+                    produced_any = False
+                    for job_metadata in (
+                        extract_job_by_name(
+                            source_client,
+                            job_name=name,
+                            automl_max_trials=automl_max_trials,
+                            automl_top_metric=automl_top_metric,
+                            automl_trial_sampling=automl_trial_sampling,
+                            automl_include_trials=automl_include_trials,
+                            download_artifacts=download_artifacts,
+                            include_trial_artifacts=include_trial_artifacts,
+                            artifacts_dir=artifacts_dir,
+                        )
+                        or []
+                    ):
+                        produced_any = True
+                        if not first_item:
+                            f.write(",\n")
+                        else:
+                            first_item = False
+                        f.write(json.dumps(job_metadata.to_dict(), indent=2))
+                        job_count += 1
+                    if not produced_any:
+                        # Record missing after attempted retrieval
+                        missing_requested.append(name)
+            else:
+                print("Extracting all top-level jobs and their descendants...")
+                for job_metadata in extract_all_jobs(
+                    source_client,
+                    limit=limit,
+                    automl_max_trials=automl_max_trials,
+                    automl_top_metric=automl_top_metric,
+                    automl_trial_sampling=automl_trial_sampling,
+                    automl_include_trials=automl_include_trials,
+                    download_artifacts=download_artifacts,
+                    include_trial_artifacts=include_trial_artifacts,
+                    artifacts_dir=artifacts_dir,
+                ):
+                    if not first_item:
+                        f.write(",\n")
+                    else:
+                        first_item = False
+                    f.write(json.dumps(job_metadata.to_dict(), indent=2))
+                    job_count += 1
+            f.write("]\n")
+
+        if include_names and missing_requested:
+            logger.warning(
+                f"{len(missing_requested)} requested top-level job name(s) not found and were skipped: {missing_requested}"
+            )
 
         print(
             f"\nSuccessfully extracted {job_count} total jobs (including descendants) to {output_path}"
@@ -1113,6 +1216,18 @@ if __name__ == "__main__":
 
     include_names: Optional[Set[str]] = set()
     if args.include:
+        # Heuristic: user accidentally passed a file path to --include
+        inc_clean = args.include.strip()
+        if (
+            inc_clean
+            and os.path.isfile(inc_clean)
+            and not args.include_file
+            and inc_clean.lower().endswith((".txt", ".list", ".csv"))
+        ):
+            logger.warning(
+                f"--include looks like a file path '{inc_clean}'. "
+                f"Did you mean to use --include-file {inc_clean}?"
+            )
         include_names.update(n.strip() for n in args.include.split(",") if n.strip())
     if args.include_file:
         try:
