@@ -290,8 +290,10 @@ def log_metrics(
                     f"Failed to convert or log metric '{key}' with value '{value}': {e}"
                 )
 
-        mlflow.set_tag("replayed_from_job", job_id)
-        print(f"Set tag 'replayed_from_job' = {job_id}")
+        # NOTE: Removed duplicate tag 'replayed_from_job' (original_job_id already logged at pipeline build level)
+        # If needed in future, reintroduce behind a flag.
+        mlflow.set_tag("original_job_id", job_id)
+        print(f"Set tag 'original_job_id' = {job_id}")
 
     except Exception as e:
         print(f"An error occurred during MLflow logging: {e}")

@@ -3,7 +3,7 @@
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-Replay Azure Machine Learning jobs from a SOURCE workspace into a TARGET workspace-preserving hierarchy, metrics, and original artifacts and logs - without re‑running the original code.
+Replay Azure Machine Learning jobs from a SOURCE workspace into a TARGET workspace—preserving multi‑level pipeline hierarchy, metrics, and original artifacts & logs—without re‑running the original code.
 
 ![All Jobs Overview](/assets/docs/all_jobs.png)
 
@@ -25,11 +25,11 @@ python -m extractor.extract_jobs --source config/source_config.json --output dat
 #    (Faster with threads & skip artifact enumeration if not needed yet)
 # python -m extractor.extract_jobs --source config/source_config.json --output data/jobs.json --parallel 8 --no-artifacts
 
-# 2) Replay
-# dry-run to inspect without submission
-python -m replayer.build_pipeline --source config/source_config.json --target config/target_config.json --input data/jobs.json --dry-run
-# full replay
-python -m replayer.build_pipeline --source config/source_config.json --target config/target_config.json --input data/jobs.json
+# 2) Replay (multi-level hierarchy preserved)
+# dry-run to inspect structure (add --debug-hierarchy for tree view)
+python -m replayer.build_pipeline --source config/source_config.json --target config/target_config.json --input data/jobs.json --dry-run --debug-hierarchy
+# full replay (submits synthetic jobs)
+python -m replayer.build_pipeline --source config/source_config.json --target config/target_config.json --input data/jobs.json --debug-hierarchy
 ```
 
 ---
@@ -62,15 +62,10 @@ Skip artifact enumeration (faster, no replay artifacts later):
 python -m extractor.extract_jobs --source config/source_config.json --output data/jobs.json --no-artifacts --parallel 12
 ```
 
-AutoML trial expansion at replay:
+Hierarchy debug (prints pipeline tree before submitting):
 
 ```powershell
-python -m replayer.build_pipeline `
-  --input data/jobs.json `
-  --target config/target_config.json `
-  --expand-automl-trials `
-  --replay-automl-max-trials 15 `
-  --replay-automl-trial-sampling best
+python -m replayer.build_pipeline --input data/jobs.json --target config/target_config.json --debug-hierarchy --dry-run
 ```
 
 ---
@@ -79,7 +74,7 @@ python -m replayer.build_pipeline `
 
 1. **Extraction** – Collect job & pipeline step metadata, metrics, params, tags, plus optional artifact/log relative paths (no downloads).
 2. **Replay** – Build lightweight synthetic jobs that log the original metrics & tags and (optionally) download the original artifacts/logs into `./outputs` so they appear in Studio.
-3. **(Optional) AutoML Expansion** – Expand parent AutoML runs into replayed trial nodes with ranking metadata.
+3. **Multi-level Pipeline Preservation** – Each original pipeline (including nested pipelines) becomes a synthetic pipeline containing only its direct leaf (non‑pipeline) steps; nested pipelines are replayed separately and linked via tags.
 
 No original training/inference code is executed.
 
@@ -87,18 +82,19 @@ No original training/inference code is executed.
 
 ## ✨ Features
 
-| Capability                           | Status | Notes                            |
-| ------------------------------------ | ------ | -------------------------------- |
-| Cross-workspace migration            | ✅     | Source → Target                  |
-| Pipeline hierarchy reconstruction    | ✅     | Synthetic mapping                |
-| Metrics / params / tags replay       | ✅     | MLflow logging                   |
-| Artifact path manifest enumeration   | ✅     | Optional; lightweight (no bytes) |
-| In-run artifact & log replay         | ✅     | Downloads into `./outputs`       |
-| AutoML trial expansion (replay only) | ✅     | Optional selection + ranking     |
-| Dry-run planning                     | ✅     | Build without submit             |
-| Filtering (names, list, limit)       | ✅     | Flexible selection               |
-| Logs preservation (namespaced)       | ✅     | Under `original_logs/`           |
-| Dataset / data asset recreation      | ❌     | Out of scope                     |
+| Capability                          | Status | Notes                                                  |
+| ----------------------------------- | ------ | ------------------------------------------------------ |
+| Cross-workspace migration           | ✅     | Source → Target                                        |
+| Multi-level pipeline reconstruction | ✅     | Nested pipelines preserved (no flattening)             |
+| Metrics / params / tags replay      | ✅     | MLflow logging                                         |
+| Artifact path manifest enumeration  | ✅     | Optional; lightweight (no bytes)                       |
+| In-run artifact & log replay        | ✅     | Downloads into `./outputs`                             |
+| AutoML trial expansion              | ❌     | Disabled (previous flag removed; open issue if needed) |
+| Dry-run planning                    | ✅     | Build without submit                                   |
+| Filtering (names, list, limit)      | ✅     | Flexible selection                                     |
+| Logs preservation (namespaced)      | ✅     | Under `original_logs/`                                 |
+| Hierarchy debug tree                | ✅     | `--debug-hierarchy` flag                               |
+| Dataset / data asset recreation     | ❌     | Out of scope                                           |
 
 ---
 
@@ -116,14 +112,11 @@ Create `config/source_config.json` & `config/target_config.json` from the provid
 
 ---
 
-## 🧪 AutoML Expansion
+## 🧪 AutoML Expansion (Deprecated)
 
-When `--expand-automl-trials` is used during replay:
+AutoML trial expansion has been disabled in the current version to prioritize accurate multi-level hierarchy reconstruction.
 
-- Parent run becomes a pipeline node tagged `automl_role=automl_parent`.
-- Selected trials become nodes tagged `automl_role=automl_trial` plus ranking tags.
-- Strategies: `best`, `first`, `random` (with optional cap via `--replay-automl-max-trials`).
-- Use `--replay-automl-top-metric` to pin the metric used for ordering when ambiguous.
+If you need historical trial node replication, pin to an earlier commit or open an issue describing your use case.
 
 ---
 
@@ -155,40 +148,46 @@ If you skip enumeration (`--no-artifacts`), artifact replay is naturally absent.
 
 ### Replay (`python -m replayer.build_pipeline`)
 
-| Flag                                                 | Purpose                      |
-| ---------------------------------------------------- | ---------------------------- |
-| `--input FILE`                                       | Extracted jobs JSON          |
-| `--target PATH`                                      | Target workspace config JSON |
-| `--limit N`                                          | Cap number of replay units   |
-| `--dry-run`                                          | Build only                   |
-| `--expand-automl-trials`                             | Expand AutoML trials         |
-| `--replay-automl-max-trials N`                       | Cap expanded trials          |
-| `--replay-automl-top-metric M`                       | Primary metric override      |
-| `--replay-automl-trial-sampling (best/first/random)` | Trial ordering               |
+| Flag                | Purpose                                         |
+| ------------------- | ----------------------------------------------- |
+| `--input FILE`      | Extracted jobs JSON                             |
+| `--target PATH`     | Target workspace config JSON                    |
+| `--source PATH`     | Source workspace config JSON (for artifacts)    |
+| `--limit N`         | Cap number of replay units                      |
+| `--dry-run`         | Build only (no submission)                      |
+| `--copy-artifacts`  | Enable artifact & log download into `./outputs` |
+| `--debug-hierarchy` | Print multi-level pipeline tree (dry or submit) |
 
 ---
 
 ## 🏷 Lineage Tagging
 
-Each replayed run/step carries at least:
+Each replayed run/step carries lineage tags:
 
-- `original_job_id` - the source run identifier.
+- `original_job_id` – Source run identifier.
+- `original_parent_pipeline_id` – (Pipelines only) The immediate parent pipeline’s original ID (if nested).
+- `original_pipeline_depth` – 0 for root pipelines, increasing with nesting.
+- `original_parent_job_id` – For leaf steps inside a replayed pipeline (points to original pipeline parent).
 
-(If a secondary tag like `replayed_from_job` appears, it may be deprecated.)
+### Removed or Deprecated
+
+- `replayed_from_job` (superseded by `original_job_id`).
+- All `automl_*` expansion tags (feature disabled).
 
 ---
 
 ## 📦 Replayed vs Skipped
 
-| Category                   | Replayed? | Notes                            |
-| -------------------------- | --------- | -------------------------------- |
-| Hierarchy (pipelines)      | ✅        | Synthetic structure              |
-| Metrics / params / tags    | ✅        | Logged via MLflow                |
-| Timestamps (wall clock)    | Partial   | Original stored as metadata only |
-| Original code execution    | ❌        | Not re-run                       |
-| AutoML trials              | ✅ opt    | If expansion flag set            |
-| Artifacts / logs           | ✅ opt    | Downloaded into `./outputs`      |
-| Registered datasets/assets | ❌        | Not recreated                    |
+| Category                   | Replayed? | Notes                             |
+| -------------------------- | --------- | --------------------------------- |
+| Hierarchy (pipelines)      | ✅        | Synthetic structure               |
+| Metrics / params / tags    | ✅        | Logged via MLflow                 |
+| Timestamps (wall clock)    | Partial   | Original stored as metadata only  |
+| Original code execution    | ❌        | Not re-run                        |
+| AutoML trials (expanded)   | ❌        | Expansion disabled in current rev |
+| Hierarchy (nested)         | ✅        | Multi-level preserved             |
+| Artifacts / logs           | ✅ opt    | Downloaded into `./outputs`       |
+| Registered datasets/assets | ❌        | Not recreated                     |
 
 ---
 
@@ -209,8 +208,8 @@ Logs: `logs/extract_jobs_*.log`, `logs/replayer_*.log`.
 ## 🧱 Architecture Overview
 
 1. Metadata Extraction → JSON manifest of jobs/metrics/paths
-2. Replay Construction → Build synthetic pipeline/jobs
-3. Replay Execution → Metrics logged; optional artifact download; lineage tagging
+2. Replay Construction → Build synthetic pipeline/jobs (one per original pipeline level)
+3. Replay Execution → Metrics logged; optional artifact download; hierarchy & lineage tagging
 4. Studio Visibility → Files under `./outputs` auto-surfaced
 
 ---
@@ -234,7 +233,7 @@ Focused PRs (docs, tests, small flags) welcome.
 
 ## ❓ Help
 
-- Azure ML Docs: https://learn.microsoft.com/azure/machine-learning/
+- Azure ML Docs: <https://learn.microsoft.com/azure/machine-learning/>
 - Open an issue for support / ideas
 
 ---
