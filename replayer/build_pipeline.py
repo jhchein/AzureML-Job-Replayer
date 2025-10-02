@@ -2,11 +2,12 @@ import argparse
 import json
 import logging
 import os
+import random
 import shutil
 import tempfile
 import uuid
-from typing import Dict, List, Optional, Tuple, Set, Any
-import random
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from azure.ai.ml import (
     Input,
@@ -18,6 +19,12 @@ from azure.ai.ml.entities import (
     UserIdentityConfiguration,
 )
 from azure.core.exceptions import HttpResponseError
+from azure.identity import AzureCliCredential
+from azure.storage.blob import (
+    BlobServiceClient,
+    ContainerSasPermissions,
+    generate_container_sas,
+)
 
 from extractor.extract_jobs import JobMetadata
 from replayer.dummy_components import (
@@ -99,14 +106,11 @@ def build_dummy_pipeline_for_children(
     temp_dir_path: str,
     *,
     children_map: Dict[str, List[JobMetadata]],
-    jobs_by_name: Dict[str, JobMetadata],
     expand_automl_trials: bool = False,
     replay_automl_max_trials: Optional[int] = None,
     replay_automl_top_metric: Optional[str] = None,
     replay_automl_trial_sampling: str = "best",  # best|first|random
-    artifacts_dir: Optional[str] = None,
-    upload_artifacts: bool = True,
-    include_trial_artifacts: bool = False,
+    manifest_paths: Optional[Dict[str, str]] = None,
 ) -> Optional[PipelineJob]:
     if not child_jobs:
         return None
@@ -266,22 +270,30 @@ def build_dummy_pipeline_for_children(
             print(f"ERROR: Failed to write temp metrics file {temp_filepath}: {e}")
             continue
 
+        manifest_path = None
+        if manifest_paths:
+            manifest_path = manifest_paths.get(step_job_meta.name)
+        if not manifest_path:
+            # Create disabled manifest if absent
+            fd, manifest_path = tempfile.mkstemp(suffix="_disabled_manifest.json")
+            with os.fdopen(fd, "w", encoding="utf-8") as mf:
+                json.dump(
+                    {
+                        "schema_version": 1,
+                        "disabled": True,
+                        "original_run_id": step_job_meta.name,
+                        "relative_paths": [],
+                    },
+                    mf,
+                )
+
         step_inputs = dict(
             original_job_id=step_job_meta.name,
             metrics_file=Input(type=AssetTypes.URI_FILE, path=temp_filepath),
+            artifact_manifest=Input(type=AssetTypes.URI_FILE, path=manifest_path),
         )
         # Attach artifacts if enabled
-        if upload_artifacts and artifacts_dir:
-            # Determine if this is an automl trial and whether it's included
-            is_trial = step_info["role"] == "automl_trial"
-            if (not is_trial) or (is_trial and include_trial_artifacts):
-                run_artifacts_path = os.path.join(artifacts_dir, step_job_meta.name)
-                if os.path.isdir(run_artifacts_path):
-                    step_inputs["artifacts_dir"] = Input(
-                        type=AssetTypes.URI_FOLDER, path=run_artifacts_path
-                    )
-                elif is_trial and not include_trial_artifacts:
-                    pass
+        # (artifacts_dir temporarily disabled in component for debugging quoting issue)
         step = replay_metrics_component(**step_inputs)
 
         # Naming strategy
@@ -360,23 +372,36 @@ def build_dummy_pipeline_for_children(
 def build_dummy_standalone_job(
     original_job: JobMetadata,
     metrics_file_path: str,
+    # *,
+    # artifacts_dir: Optional[str] = None,
+    # upload_artifacts: bool = True,
     *,
-    artifacts_dir: Optional[str] = None,
-    upload_artifacts: bool = True,
+    artifact_manifest_path: Optional[str] = None,
 ):
     """
     Builds a dummy CommandJob using a pre-existing metrics file path.
     """
     # Metrics file is already created by the caller
 
+    if not artifact_manifest_path:
+        fd, artifact_manifest_path = tempfile.mkstemp(suffix="_disabled_manifest.json")
+        with os.fdopen(fd, "w", encoding="utf-8") as mf:
+            json.dump(
+                {
+                    "schema_version": 1,
+                    "disabled": True,
+                    "original_run_id": original_job.name,
+                    "relative_paths": [],
+                },
+                mf,
+            )
+
     inputs = dict(
         original_job_id=original_job.name,
         metrics_file=Input(type=AssetTypes.URI_FILE, path=metrics_file_path),
+        artifact_manifest=Input(type=AssetTypes.URI_FILE, path=artifact_manifest_path),
     )
-    if upload_artifacts and artifacts_dir:
-        run_dir = os.path.join(artifacts_dir, original_job.name)
-        if os.path.isdir(run_dir):
-            inputs["artifacts_dir"] = Input(type=AssetTypes.URI_FOLDER, path=run_dir)
+    # (artifacts_dir temporarily disabled in component for debugging quoting issue)
     job = replay_metrics_component(**inputs)
 
     # Apply runtime settings
@@ -395,9 +420,29 @@ def build_dummy_standalone_job(
     return job
 
 
+def build_container_sas(service: BlobServiceClient, container: str, hours: int = 4):
+    start = datetime.now(timezone.utc) - timedelta(minutes=5)
+    expiry = datetime.now(timezone.utc) + timedelta(hours=hours)
+    try:
+        udk = service.get_user_delegation_key(start, expiry)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(
+            "Failed to get user delegation key (need Storage Blob Data Delegator OR Data Owner on the storage account). "
+            f"Underlying error: {e}"
+        ) from e
+    # For write scenarios we may request additional permissions later; default read/list
+    perms = ContainerSasPermissions(read=True, list=True)
+    sas = generate_container_sas(
+        account_name=str(service.account_name),
+        container_name=container,
+        user_delegation_key=udk,
+        permission=perms,
+        expiry=expiry,
+    )
+    return sas
+
+
 # --- Main execution logic ---
-
-
 def main(args):
     print("Loading job metadata...")
     try:
@@ -407,12 +452,139 @@ def main(args):
         print(f"Loaded {len(all_jobs_metadata)} job metadata records.")
     except Exception as e:
         print(f"Error loading or parsing {args.input}: {e}")
-        # Optional: Log exception details if logging is configured
         exit(1)
 
     # --- Build indexes for nested pipeline aware replay ---
     jobs_by_name, children_map, pipeline_names = _index_jobs(all_jobs_metadata)
     depths = _compute_depths(jobs_by_name)
+
+    manifests_by_job: Dict[str, str] = {}
+    source_account_name = None
+    target_account_name = None
+    source_container_name = None
+    target_container_name = None
+    source_sas = None
+    target_sas = None
+    if args.copy_artifacts and args.source:
+        try:
+            source_client = get_ml_client(args.source)
+            source_datastore = source_client.datastores.get("workspaceblobstore")
+            target_client_for_manifest = get_ml_client(args.target)
+            target_datastore = target_client_for_manifest.datastores.get(
+                "workspaceblobstore"
+            )
+            credential = AzureCliCredential()
+            source_account_name = getattr(source_datastore, "account_name", None)
+            target_account_name = getattr(target_datastore, "account_name", None)
+            source_container_name = "azureml"
+            target_container_name = "azureml"
+            src_blob_service = BlobServiceClient(
+                f"https://{source_account_name}.blob.core.windows.net",
+                credential=credential,
+            )
+            tgt_blob_service = BlobServiceClient(
+                f"https://{target_account_name}.blob.core.windows.net",
+                credential=credential,
+            )
+            # Build SAS: source read, target write
+            source_sas = build_container_sas(
+                src_blob_service, source_container_name, hours=6
+            )
+            # Write-enabled target SAS
+            start = datetime.now(timezone.utc) - timedelta(minutes=5)
+            expiry = datetime.now(timezone.utc) + timedelta(hours=6)
+            try:
+                udk_tgt = tgt_blob_service.get_user_delegation_key(start, expiry)
+                perms_tgt = ContainerSasPermissions(
+                    read=True, list=True, create=True, write=True, add=True
+                )
+                target_sas = generate_container_sas(
+                    account_name=str(tgt_blob_service.account_name),
+                    container_name=target_container_name,
+                    user_delegation_key=udk_tgt,
+                    permission=perms_tgt,
+                    expiry=expiry,
+                )
+            except Exception as e:  # noqa: BLE001
+                print(f"WARNING: Failed generating write-enabled SAS for target: {e}")
+                target_sas = None
+            print("Prepared storage context for in-run server-side artifact copy.")
+        except Exception as e:  # noqa: BLE001
+            print(f"WARNING: Could not prepare storage context for manifests: {e}")
+            source_account_name = None
+
+    for jm in jobs_raw:  # jobs_raw contains dicts
+        meta = JobMetadata(**jm)
+        rel_paths = getattr(meta, "mlflow_artifact_paths", None) or []
+        if not (args.copy_artifacts and source_account_name and rel_paths):
+            fd, manifest_path = tempfile.mkstemp(
+                suffix=f"_{meta.name}_manifest_disabled.json"
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as mf:
+                json.dump(
+                    {
+                        "schema_version": 1,
+                        "disabled": True,
+                        "original_run_id": meta.name,
+                        "relative_paths": [],
+                    },
+                    mf,
+                )
+            manifests_by_job[meta.name] = manifest_path
+            continue
+        # Select only relevant folders: outputs and log families (logs, system_logs, user_logs)
+        outputs_only = [p for p in rel_paths if p.startswith("outputs/")]
+        log_paths = [
+            p
+            for p in rel_paths
+            if p.startswith("logs/")
+            or p.startswith("system_logs/")
+            or p.startswith("user_logs/")
+        ]
+        combined = outputs_only + [p for p in log_paths if p not in outputs_only]
+        selected_paths = combined if combined else rel_paths
+        # Provide normalized mapping guidance (not consumed yet but helpful for debugging / future logic)
+        normalized_selected_paths = []
+        for p in selected_paths:
+            if p.startswith("outputs/"):
+                normalized_selected_paths.append(p[len("outputs/") :])
+            elif (
+                p.startswith("logs/")
+                or p.startswith("system_logs/")
+                or p.startswith("user_logs/")
+            ):
+                normalized_selected_paths.append(f"original_logs/{p}")
+            else:
+                normalized_selected_paths.append(p)
+        fd, manifest_path = tempfile.mkstemp(
+            suffix=f"_{meta.name}_artifact_manifest.json"
+        )
+        manifest = {
+            "schema_version": 1,
+            "disabled": False,
+            "original_run_id": meta.name,
+            "source": {
+                "account": source_account_name,
+                "container": source_container_name,
+                "prefix": f"ExperimentRun/dcid.{meta.name}",
+                "sas": source_sas,
+            },
+            "target": {
+                "account": target_account_name,
+                "container": target_container_name,
+                "sas": target_sas,
+            },
+            "relative_paths": selected_paths,
+            "normalized_relative_paths": normalized_selected_paths,
+            "total_rel_paths": len(rel_paths),
+            "filtered_outputs": len(outputs_only),
+            "filtered_logs": len(log_paths),
+        }
+        with os.fdopen(fd, "w", encoding="utf-8") as mf:
+            json.dump(manifest, mf)
+        manifests_by_job[meta.name] = manifest_path
+    if manifests_by_job:
+        print(f"Prepared {len(manifests_by_job)} artifact manifest file(s).")
 
     # Define replay "units": each pipeline job (even if nested) + each standalone root command job
     standalone_root_names = [
@@ -438,6 +610,7 @@ def main(args):
             print(
                 f"Promoted {len(promoted)} standalone AutoML root job(s) to pipeline units for trial expansion: {promoted}"
             )
+
     # Order units by depth then name for deterministic processing (roots first)
     pipeline_unit_names = sorted(pipeline_names, key=lambda n: (depths.get(n, 0), n))
     standalone_root_names = sorted(
@@ -452,14 +625,13 @@ def main(args):
     )
 
     # --- Connect to Client and Register Environment ---
-    registered_env_id_for_jobs = None
     try:
         client = get_ml_client(args.target)
         print(f"Connected to target workspace: {client.workspace_name}")
 
         # Register the environment only if not doing a dry run
         if not args.dry_run:
-            from replayer.dummy_components import DUMMY_ENV, REGISTERED_ENV_ID
+            from replayer.dummy_components import DUMMY_ENV
 
             print(
                 f"Ensuring dummy environment '{DUMMY_ENV.name}:{DUMMY_ENV.version}' exists..."
@@ -467,20 +639,12 @@ def main(args):
             try:
                 env_reg = client.environments.create_or_update(DUMMY_ENV)
                 print(f" -> Environment '{env_reg.name}:{env_reg.version}' is ready.")
-                registered_env_id_for_jobs = REGISTERED_ENV_ID
             except Exception as e:
                 print(f"❌ Error registering/updating dummy environment: {e}")
                 print("Cannot proceed without the registered environment. Exiting.")
                 exit(1)
-        else:
-            from replayer.dummy_components import REGISTERED_ENV_ID
-
-            registered_env_id_for_jobs = REGISTERED_ENV_ID
-            print("Dry run: Skipping environment registration.")
-
     except Exception as e:
         print(f"Error connecting to target workspace: {e}")
-        # Optional: Log exception details if logging is configured
         exit(1)
 
     # --- Process and Submit/Dry-Run Jobs ---
@@ -490,13 +654,9 @@ def main(args):
     processed_count = 0
     job_map = {}  # original_id -> new_job_name / description
 
-    # Ensure environment ID was set (should be unless dry run skipped it, which is ok for dry run)
-    if not registered_env_id_for_jobs and not args.dry_run:
-        print("Error: Environment ID was not set after registration attempt. Exiting.")
-        exit(1)
-
     total_units = len(replay_units)
 
+    # We also optionally prepare for artifact copy: we only need mapping original->replay job names.
     for unit_type, job_name in replay_units:
         if args.limit is not None and processed_count >= args.limit:
             print(f"\nReached processing limit ({args.limit}). Stopping.")
@@ -528,8 +688,9 @@ def main(args):
                 job_to_submit = build_dummy_standalone_job(
                     original_job_metadata,
                     temp_metrics_filepath_standalone,
-                    artifacts_dir=args.artifacts_dir,
-                    upload_artifacts=not args.no_artifacts,
+                    artifact_manifest_path=manifests_by_job.get(
+                        original_job_metadata.name
+                    ),
                 )
             elif unit_type == "pipeline":
                 parent_meta = jm
@@ -544,14 +705,11 @@ def main(args):
                         children_meta,
                         temp_pipeline_dir_path,
                         children_map=children_map,
-                        jobs_by_name=jobs_by_name,
                         expand_automl_trials=args.expand_automl_trials,
                         replay_automl_max_trials=args.replay_automl_max_trials,
                         replay_automl_top_metric=args.replay_automl_top_metric,
                         replay_automl_trial_sampling=args.replay_automl_trial_sampling,
-                        artifacts_dir=args.artifacts_dir,
-                        upload_artifacts=not args.no_artifacts,
-                        include_trial_artifacts=args.include_trial_artifacts,
+                        manifest_paths=manifests_by_job,
                     )
                     if job_to_submit is None:
                         print(
@@ -568,8 +726,7 @@ def main(args):
                     job_to_submit = build_dummy_standalone_job(
                         parent_meta,
                         temp_metrics_filepath_standalone,
-                        artifacts_dir=args.artifacts_dir,
-                        upload_artifacts=not args.no_artifacts,
+                        artifact_manifest_path=manifests_by_job.get(parent_meta.name),
                     )
             else:
                 print(f" -> Unknown unit type '{unit_type}'. Skipping.")
@@ -692,6 +849,8 @@ def main(args):
         print(" (No jobs submitted or processed)")
     print("----------------------")
 
+    print("Done.")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -701,13 +860,13 @@ if __name__ == "__main__":
     parser.add_argument("--input", required=True, help="Path to extracted jobs.json")
     parser.add_argument(
         "--dry-run",
-        action="store_true",  # Makes it a flag, True if present
+        action="store_true",
         help="Perform parsing and build job objects, but do not submit to Azure ML.",
     )
     parser.add_argument(
         "--limit",
         type=int,
-        default=None,  # Default is no limit
+        default=None,
         help="Limit the number of original execution units (pipelines/standalone jobs) to process for testing.",
     )
     parser.add_argument(
@@ -735,22 +894,24 @@ if __name__ == "__main__":
         help="Sampling strategy when selecting AutoML trials for replay expansion.",
     )
     parser.add_argument(
-        "--no-artifacts",
-        action="store_true",
-        help="Do not upload/log artifacts for runs (artifacts are uploaded by default).",
-    )
-    parser.add_argument(
-        "--artifacts-dir",
-        type=str,
-        default="artifacts_export",
-        help="Directory root containing per-run artifact folders from extraction phase.",
-    )
-    parser.add_argument(
         "--include-trial-artifacts",
         action="store_true",
         help="Upload artifacts for AutoML trial runs when trials are expanded (default: only parent/non-trial).",
+        default=False,
     )
-    # Removed deprecated --keep-automl-parent-step: parent always retained when expanding trials.
+    parser.add_argument(
+        "--source",
+        type=str,
+        default=None,
+        help="Path to source workspace config JSON (required for --copy-artifacts to resolve original artifact locations).",
+    )
+    parser.add_argument(
+        "--copy-artifacts",
+        action="store_true",
+        help="After replay submission, perform server-side copy of original artifacts into a dedicated migration prefix (no filtering).",
+        default=True,
+    )
+
     args = parser.parse_args()
 
     main(args)

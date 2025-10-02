@@ -1,51 +1,44 @@
-# %load_ext autoreload
-# %autoreload 2
 import argparse
 import json
 import logging
 import os
 import sys
-import random
+import time
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, Future
+from collections import deque
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterator, List, Optional, Set
+from threading import Lock
+from typing import Any, Dict, List, Optional, Set, Tuple
+import random as _rand  # jitter for retries
 
 import mlflow
 from azure.ai.ml import MLClient
 from azure.ai.ml.entities import Job
 from azure.core.exceptions import ResourceNotFoundError
 from dateutil import parser as date_parser
-from mlflow.entities import Run as MlflowRun
 from mlflow.exceptions import MlflowException
 from mlflow.tracking import MlflowClient
-from tqdm import tqdm
 
 from utils.aml_clients import get_ml_client
 
 # --- Logging Setup ---
 
-# Get our specific logger
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)  # Capture INFO level messages for the file
-logger.propagate = False  # Prevent propagation to root logger
+logger.setLevel(logging.INFO)
+logger.propagate = False
 
-# Also configure the azure SDK loggers if desired
 azure_logger = logging.getLogger("azure")
-azure_logger.setLevel(logging.INFO)  # Capture SDK INFO messages for the file
+azure_logger.setLevel(logging.INFO)
 azure_logger.propagate = False
 
 
 def setup_logging():
-    """Configures file and console logging handlers."""
-    # Create logs directory
     log_dir = "logs"
     os.makedirs(log_dir, exist_ok=True)
-
-    # Create timestamped log file name
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_filename = os.path.join(log_dir, f"extract_jobs_{timestamp}.log")
 
-    # --- File Handler (INFO and above) ---
     file_handler = logging.FileHandler(log_filename, encoding="utf-8")
     file_handler.setLevel(logging.INFO)
     file_formatter = logging.Formatter(
@@ -53,71 +46,52 @@ def setup_logging():
     )
     file_handler.setFormatter(file_formatter)
 
-    # --- Console Handler (WARNING and above) ---
-    # Use sys.stderr because tqdm typically writes to stderr
     console_handler = logging.StreamHandler(sys.stderr)
     console_handler.setLevel(logging.WARNING)
     console_formatter = logging.Formatter("%(levelname)s: %(name)s: %(message)s")
     console_handler.setFormatter(console_formatter)
 
-    # --- Add Handlers ---
-    # Add handlers to our specific logger
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
-
-    # Add handlers to the azure SDK logger
     azure_logger.addHandler(file_handler)
     azure_logger.addHandler(console_handler)
 
-    print(f"Detailed logs will be written to: {log_filename}")  # Info to stdout
-
-
-# --- Helper Functions (Keep as before) ---
+    print(f"Detailed logs will be written to: {log_filename}")
 
 
 def safe_isoformat(dt_obj: Any) -> Optional[str]:
-    """Safely convert a datetime object or timestamp string/ms to ISO format string."""
     if dt_obj is None:
         return None
     try:
-        if isinstance(dt_obj, (int, float)):  # Assume milliseconds if large number
-            if dt_obj > 1e12:  # Simple heuristic for milliseconds vs seconds
+        if isinstance(dt_obj, (int, float)):
+            if dt_obj > 1e12:
                 dt_obj = datetime.fromtimestamp(dt_obj / 1000, tz=timezone.utc)
-            else:  # Assume seconds
+            else:
                 dt_obj = datetime.fromtimestamp(dt_obj, tz=timezone.utc)
         elif isinstance(dt_obj, str):
-            # Handle potential timezone info like 'Z' or +00:00
             dt_obj = (
                 date_parser.isoparse(dt_obj)
                 if ("Z" in dt_obj or "+" in dt_obj)
                 else date_parser.parse(dt_obj)
             )
-
         if isinstance(dt_obj, datetime):
             if dt_obj.tzinfo is None:
-                dt_obj = dt_obj.replace(
-                    tzinfo=timezone.utc
-                )  # Assume UTC if no timezone
+                dt_obj = dt_obj.replace(tzinfo=timezone.utc)
             return dt_obj.isoformat()
-        else:
-            logger.warning(
-                f"Cannot convert non-datetime object to ISO format: {dt_obj} (Type: {type(dt_obj)})"
-            )
-            return str(dt_obj)  # Fallback to string representation
-    except (ValueError, TypeError, OverflowError, date_parser.ParserError) as e:
+        logger.warning(
+            f"Cannot convert non-datetime object to ISO format: {dt_obj} (Type: {type(dt_obj)})"
+        )
+        return str(dt_obj)
+    except (ValueError, TypeError, OverflowError, date_parser.ParserError) as e:  # type: ignore[attr-defined]
         logger.warning(f"Failed to convert timestamp {dt_obj} to ISO format: {e}")
-        return str(dt_obj)  # Fallback
+        return str(dt_obj)
 
 
 def safe_duration(start: Any, end: Any) -> Optional[float]:
-    """Safely calculate duration in seconds between two timestamp representations."""
     if start is None or end is None:
         return None
     try:
-        start_dt = None
-        end_dt = None
 
-        # Function to parse time input
         def parse_time(time_input):
             if isinstance(time_input, (int, float)):
                 dt = datetime.fromtimestamp(
@@ -125,306 +99,188 @@ def safe_duration(start: Any, end: Any) -> Optional[float]:
                     tz=timezone.utc,
                 )
             elif isinstance(time_input, str):
-                # Use isoparse for better ISO 8601 handling, fallback to parse
                 try:
                     dt = date_parser.isoparse(time_input)
                 except ValueError:
                     dt = date_parser.parse(time_input)
-
             elif isinstance(time_input, datetime):
                 dt = time_input
             else:
                 return None
-
-            # Ensure timezone awareness for comparison
             if dt.tzinfo is None:
                 return dt.replace(tzinfo=timezone.utc)
-            return dt.astimezone(timezone.utc)  # Convert aware datetimes to UTC
+            return dt.astimezone(timezone.utc)
 
         start_dt = parse_time(start)
         end_dt = parse_time(end)
 
         if start_dt and end_dt:
-            # Ensure end time is after start time
             if end_dt >= start_dt:
                 return (end_dt - start_dt).total_seconds()
-            else:
-                logger.warning(
-                    f"End time {end_dt} is before start time {start_dt}. Cannot calculate duration."
-                )
-                return None
-        else:
             logger.warning(
-                f"Could not parse start ({start}, type: {type(start)}) or end ({end}, type: {type(end)}) time for duration calculation."
+                f"End time {end_dt} is before start time {start_dt}. Cannot calculate duration."
             )
             return None
-
-    except (ValueError, TypeError, OverflowError, date_parser.ParserError) as e:
+        logger.warning(
+            f"Could not parse start ({start}, type: {type(start)}) or end ({end}, type: {type(end)}) time for duration calculation."
+        )
+        return None
+    except (ValueError, TypeError, OverflowError, date_parser.ParserError) as e:  # type: ignore[attr-defined]
         logger.warning(f"Failed to calculate duration between {start} and {end}: {e}")
         return None
 
 
 def convert_complex_dict(obj: Any) -> Any:
-    """Recursively convert complex objects (like SDK entities) within dicts/lists to basic types."""
     if isinstance(obj, dict):
-        # Handle potential non-string keys if they are basic types
         return {
             (
                 str(k) if not isinstance(k, (str, int, float, bool, type(None))) else k
             ): convert_complex_dict(v)
             for k, v in obj.items()
         }
-    elif isinstance(obj, list) or isinstance(obj, tuple):  # Include tuples
+    elif isinstance(obj, (list, tuple)):
         return [convert_complex_dict(item) for item in obj]
-    elif hasattr(obj, "_to_dict"):  # Handle Azure SDK entities with _to_dict method
+    elif hasattr(obj, "_to_dict"):
         try:
             return convert_complex_dict(obj._to_dict())
-        except Exception as e:
-            logger.debug(
-                f"Could not convert object '{type(obj).__name__}' with _to_dict: {e}. Falling back."
-            )
-            pass  # Fall through to other methods
-    elif hasattr(obj, "asdict"):  # Handle dataclasses
+        except Exception:  # noqa: BLE001
+            pass
+    elif hasattr(obj, "asdict"):
         try:
             return convert_complex_dict(asdict(obj))
-        except Exception as e:
-            logger.debug(
-                f"Could not convert object '{type(obj).__name__}' with asdict: {e}. Falling back."
-            )
-            pass  # Fall through to other methods
-    elif hasattr(obj, "__dict__"):  # Generic objects
+        except Exception:  # noqa: BLE001
+            pass
+    elif hasattr(obj, "__dict__"):
         try:
-            # Filter out private/protected attributes and methods
             public_attrs = {
                 k: v
                 for k, v in vars(obj).items()
                 if not k.startswith("_") and not callable(v)
             }
-            if not public_attrs and hasattr(obj, "__slots__"):  # Handle slotted classes
+            if not public_attrs and hasattr(obj, "__slots__"):
                 public_attrs = {
                     slot: getattr(obj, slot, None)
-                    for slot in obj.__slots__
+                    for slot in obj.__slots__  # type: ignore[attr-defined]
                     if not slot.startswith("_")
                 }
-            return (
-                convert_complex_dict(public_attrs) if public_attrs else str(obj)
-            )  # Fallback if no public attrs
-        except Exception as e:
-            logger.debug(
-                f"Could not convert object '{type(obj).__name__}' using __dict__/__slots__: {e}. Falling back."
-            )
+            return convert_complex_dict(public_attrs) if public_attrs else str(obj)
+        except Exception:  # noqa: BLE001
             pass
-    # Handle basic types directly
     elif isinstance(obj, (str, int, float, bool, type(None))):
         return obj
-    # Handle specific types that need string conversion
-    elif isinstance(obj, (datetime, bytes)):
-        return (
-            safe_isoformat(obj)
-            if isinstance(obj, datetime)
-            else obj.decode("utf-8", errors="replace")
-        )
-    # Fallback for other types (timedelta, non-serializable objects)
-    else:
-        try:
-            # Attempt a generic string conversion as last resort
-            s = str(obj)
-            # Avoid overly long or complex string representations in JSON
-            if len(s) > 200:
-                s = s[:197] + "..."
-            return s
-        except Exception:
-            return f"<Unserializable object: {type(obj).__name__}>"
-
-
-# --- Artifact Download Helper (placed early so available to extraction functions) ---
-def _download_run_artifacts(
-    mlflow_client: MlflowClient,
-    run_id: str,
-    artifacts_root: str,
-    warn_if_exists: bool = True,
-):
-    """Download full artifact tree for a run into artifacts_root/<run_id>.
-    Overwrites existing folder after warning. Logs file count & total bytes. Warn if >200MB.
-    """
-    target_dir = os.path.join(artifacts_root, run_id)
+    elif isinstance(obj, datetime):
+        return safe_isoformat(obj)
+    elif isinstance(obj, bytes):
+        return obj.decode("utf-8", errors="replace")
     try:
-        if os.path.isdir(target_dir):
-            if warn_if_exists:
-                logger.warning(
-                    f"Artifact folder already exists for run {run_id}; overwriting."
-                )
-            import shutil
+        s = str(obj)
+        if len(s) > 200:
+            s = s[:197] + "..."
+        return s
+    except Exception:  # noqa: BLE001
+        return f"<Unserializable object: {type(obj).__name__}>"
 
-            shutil.rmtree(target_dir, ignore_errors=True)
-        os.makedirs(target_dir, exist_ok=True)
-        mlflow_client.download_artifacts(run_id, "", target_dir)
-        total_bytes = 0
-        file_count = 0
-        for root, _, files in os.walk(target_dir):
-            for fn in files:
-                fp = os.path.join(root, fn)
-                try:
-                    total_bytes += os.path.getsize(fp)
-                    file_count += 1
-                except OSError:
-                    pass
-        size_mb = total_bytes / (1024 * 1024) if total_bytes else 0
-        logger.info(
-            f"Downloaded artifacts for run {run_id}: {file_count} files, {size_mb:.2f} MB into {target_dir}"
-        )
-        if size_mb > 200:
+
+def _list_artifact_file_paths(mlflow_client: MlflowClient, run_id: str) -> List[str]:
+    """Return a flat list of file artifact paths for a run without downloading artifacts."""
+    paths: List[str] = []
+
+    def list_dir(prefix: str):
+        try:
+            infos = mlflow_client.list_artifacts(run_id, prefix)
+        except Exception as e:  # noqa: BLE001
             logger.warning(
-                f"Large artifact set for run {run_id}: {size_mb:.2f} MB (threshold 200MB)."
+                f"Artifact listing failed for run {run_id} prefix '{prefix}': {e}"
             )
-    except Exception as e:
-        logger.warning(f"Failed to download artifacts for run {run_id}: {e}")
+            return
+        for info in infos:
+            if getattr(info, "is_dir", False):
+                list_dir(info.path)
+            else:
+                paths.append(info.path)
 
-
-# --- Dataclass Definition ---
+    list_dir("")
+    return paths
 
 
 @dataclass
 class JobMetadata:
-    # Core Identifiers
-    name: str  # From job.name (also run_id in many cases)
-    id: Optional[str] = None  # From job.id (full ARM ID)
-    display_name: Optional[str] = None  # From job.display_name
-    job_type: Optional[str] = None  # From job.type
-    status: Optional[str] = None  # From job.status
-
-    # Hierarchy and Context
-    experiment_name: Optional[str] = None  # From job.experiment_name
-    parent_job_name: Optional[str] = None  # From job.parent_job_name
-
-    # Timestamps and Duration
-    created_at: Optional[str] = (
-        None  # From job.creation_context.created_at (ISO format)
-    )
-    start_time: Optional[str] = (
-        None  # From MLflow run.info or job.properties (ISO format)
-    )
-    end_time: Optional[str] = (
-        None  # From MLflow run.info or job.properties (ISO format)
-    )
-    duration_seconds: Optional[float] = None  # Calculated
-    # compute_duration_seconds: Optional[float] = None # Hard to get reliably
-
-    # Creator Info
-    created_by: Optional[str] = None  # From job.creation_context.created_by
-    created_by_type: Optional[str] = None  # From job.creation_context.created_by_type
-
-    # Modification Info
-    last_modified_at: Optional[str] = None  # From job.creation_context.last_modified_at
-    last_modified_by: Optional[str] = None  # From job.creation_context.last_modified_by
-    last_modified_by_type: Optional[str] = (
-        None  # From job.creation_context.last_modified_by_type
-    )
-
-    # Execution Details
-    command: Optional[str] = None  # From job.command (for CommandJobs)
-    script_name: Optional[str] = None  # From MLflow tags (mlflow.source.name)
-    environment_name: Optional[str] = None  # From job.environment (name or string)
-    environment_id: Optional[str] = None  # From job.environment (ARM ID if specified)
-    environment_variables: Optional[Dict[str, str]] = (
-        None  # From job.environment_variables
-    )
-    code_id: Optional[str] = None  # From job.code (ARM ID or path string)
-    arguments: Optional[Dict[str, Any]] = (
-        None  # From job.inputs (Literal inputs might represent args) - Alias? Let's keep command separate.
-    )
-    # job.parameters might be relevant for CommandJobs
-    job_parameters: Optional[Dict[str, Any]] = (
-        None  # From job.parameters (specific to CommandJob in REST)
-    )
-
-    # Compute Details
-    compute_target: Optional[str] = None  # From job.compute (name)
-    compute_id: Optional[str] = (
-        None  # From job.computeId (ARM ID in REST) - SDK uses job.compute? Check. -> job.compute gives name. Need properties?
-    )
-    # REST properties.computeId exists. Let's try getattr(job, 'computeId', None)
-    compute_type: Optional[str] = (
-        None  # From job.properties['_azureml.ComputeTargetType']
-    )
-    instance_count: Optional[int] = None  # From job.resources.instance_count
-    instance_type: Optional[str] = None  # From job.resources.instance_type
-
-    # Job Specific Configuration
-    distribution: Optional[Dict[str, Any]] = None  # From job.distribution
-    job_limits: Optional[Dict[str, Any]] = None  # From job.limits
-    job_inputs: Optional[Dict[str, Any]] = None  # From job.inputs
-    job_outputs: Optional[Dict[str, Any]] = None  # From job.outputs
-    identity_type: Optional[str] = None  # From job.identity.type
-    services: Optional[Dict[str, Any]] = None  # From job.services
-    job_properties: Optional[Dict[str, Any]] = (
-        None  # From job.properties (generic key-value)
-    )
-
-    # AutoML/Sweep Specific
-    task_details: Optional[Dict[str, Any]] = None  # From job.task_details (AutoML)
-    objective: Optional[Dict[str, Any]] = None  # From job.objective (Sweep)
-    search_space: Optional[Dict[str, Any]] = None  # From job.search_space (Sweep)
-    sampling_algorithm: Optional[Dict[str, Any]] = (
-        None  # From job.sampling_algorithm (Sweep)
-    )
-    early_termination: Optional[Dict[str, Any]] = (
-        None  # From job.early_termination (Sweep)
-    )
-    trial_component: Optional[Dict[str, Any]] = None  # From job.trial (Sweep)
-
-    # Pipeline Specific
-    pipeline_settings: Optional[Dict[str, Any]] = None  # From job.settings (Pipeline)
-    pipeline_sub_jobs: Optional[Dict[str, Any]] = None  # From job.jobs (Pipeline)
-
-    # Metadata
-    description: Optional[str] = None  # From job.description
-    tags: Optional[Dict[str, str]] = None  # From job.tags
-
-    # MLflow Specific Data
-    mlflow_run_id: Optional[str] = None  # From run.info.run_id
-    mlflow_run_name: Optional[str] = None  # From run.info.run_name
-    mlflow_experiment_id: Optional[str] = None  # From run.info.experiment_id
-    mlflow_user_id: Optional[str] = None  # From run.info.user_id (Often empty)
-    mlflow_artifact_uri: Optional[str] = None  # From run.info.artifact_uri
-    mlflow_metrics: Optional[Dict[str, float]] = None  # From run.data.metrics
-    mlflow_params: Optional[Dict[str, str]] = None  # From run.data.params
-    mlflow_tags: Optional[Dict[str, str]] = None  # From run.data.tags
-    mlflow_dataset_inputs: Optional[List[Any]] = None  # From run.inputs.dataset_inputs
-
-    # Add a field to store child run names/ids if needed directly on parent. Optional.
+    name: str
+    id: Optional[str] = None
+    display_name: Optional[str] = None
+    job_type: Optional[str] = None
+    status: Optional[str] = None
+    experiment_name: Optional[str] = None
+    parent_job_name: Optional[str] = None
+    created_at: Optional[str] = None
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    duration_seconds: Optional[float] = None
+    created_by: Optional[str] = None
+    created_by_type: Optional[str] = None
+    last_modified_at: Optional[str] = None
+    last_modified_by: Optional[str] = None
+    last_modified_by_type: Optional[str] = None
+    command: Optional[str] = None
+    script_name: Optional[str] = None
+    environment_name: Optional[str] = None
+    environment_id: Optional[str] = None
+    environment_variables: Optional[Dict[str, str]] = None
+    code_id: Optional[str] = None
+    arguments: Optional[Dict[str, Any]] = None
+    job_parameters: Optional[Dict[str, Any]] = None
+    compute_target: Optional[str] = None
+    compute_id: Optional[str] = None
+    compute_type: Optional[str] = None
+    instance_count: Optional[int] = None
+    instance_type: Optional[str] = None
+    distribution: Optional[Dict[str, Any]] = None
+    job_limits: Optional[Dict[str, Any]] = None
+    job_inputs: Optional[Dict[str, Any]] = None
+    job_outputs: Optional[Dict[str, Any]] = None
+    identity_type: Optional[str] = None
+    services: Optional[Dict[str, Any]] = None
+    job_properties: Optional[Dict[str, Any]] = None
+    task_details: Optional[Dict[str, Any]] = None
+    objective: Optional[Dict[str, Any]] = None
+    search_space: Optional[Dict[str, Any]] = None
+    sampling_algorithm: Optional[Dict[str, Any]] = None
+    early_termination: Optional[Dict[str, Any]] = None
+    trial_component: Optional[Dict[str, Any]] = None
+    pipeline_settings: Optional[Dict[str, Any]] = None
+    pipeline_sub_jobs: Optional[Dict[str, Any]] = None
+    description: Optional[str] = None
+    tags: Optional[Dict[str, str]] = None
+    mlflow_run_id: Optional[str] = None
+    mlflow_run_name: Optional[str] = None
+    mlflow_experiment_id: Optional[str] = None
+    mlflow_user_id: Optional[str] = None
+    mlflow_artifact_uri: Optional[str] = None
+    mlflow_metrics: Optional[Dict[str, float]] = None
+    mlflow_params: Optional[Dict[str, str]] = None
+    mlflow_tags: Optional[Dict[str, str]] = None
+    mlflow_dataset_inputs: Optional[List[Any]] = None
     child_run_ids: Optional[List[str]] = None
+    mlflow_artifact_paths: Optional[List[str]] = None  # manifest paths only
 
     def to_dict(self):
-        """Convert dataclass to dictionary, handling complex types."""
         d = {}
         for f in fields(self):
             value = getattr(self, f.name)
-            # Ensure keys are strings for JSON compatibility
             if isinstance(value, dict):
                 value = {str(k): v for k, v in value.items()}
             d[f.name] = convert_complex_dict(value)
+            # convert_complex_dict handles lists recursively
         return d
 
 
-# --- Extraction Logic ---
-
-
 def _process_job_object(job: Job, mlflow_client: MlflowClient) -> Optional[JobMetadata]:
-    """
-    Processes a single Azure ML Job object (parent or child)
-    and returns its JobMetadata.
-    Returns None if the job object itself is invalid or causes critical errors.
-    """
-    # Defensive: ensure job has a name
-    if job.name is None:  # type: ignore[has-type]
+    if job.name is None:
         logger.warning("Job object without a name encountered; skipping.")
         return None
-    job_name: str = job.name  # Use the name from the passed Job object
+    job_name: str = job.name
     logger.info(f"Processing job object: {job_name} (Type: {job.type})")
 
-    # --- MLflow Data Extraction ---
-    mlflow_run: Optional[MlflowRun] = None
     mlflow_metrics = {}
     mlflow_params = {}
     mlflow_tags_dict = {}
@@ -439,34 +295,32 @@ def _process_job_object(job: Job, mlflow_client: MlflowClient) -> Optional[JobMe
     script_name = None
 
     try:
-        # mlflow_client.get_run expects a str; guard already ensured
-        mlflow_run = mlflow_client.get_run(job_name)  # Use job_name which IS the run_id
-        if mlflow_run:
-            logger.debug(f"Found MLflow run for job {job_name}")
-            if mlflow_run.data:
-                mlflow_metrics = mlflow_run.data.metrics or {}
-                mlflow_params = mlflow_run.data.params or {}
-                mlflow_tags_dict = mlflow_run.data.tags or {}
-                script_name = mlflow_tags_dict.get("mlflow.source.name")
-                logger.info(
-                    f"Retrieved {len(mlflow_metrics)} metrics, {len(mlflow_params)} params for MLflow run {job_name}"
-                )
-            if mlflow_run.info:
-                mlflow_run_id = mlflow_run.info.run_id
-                mlflow_run_name = mlflow_run.info.run_name
-                mlflow_experiment_id = mlflow_run.info.experiment_id
-                mlflow_user_id = mlflow_run.info.user_id
-                mlflow_artifact_uri = mlflow_run.info.artifact_uri
-                mlflow_start_time_ms = mlflow_run.info.start_time
-                mlflow_end_time_ms = mlflow_run.info.end_time
-            if hasattr(mlflow_run, "inputs") and hasattr(
-                mlflow_run.inputs, "dataset_inputs"
-            ):
-                mlflow_dataset_inputs = convert_complex_dict(
-                    mlflow_run.inputs.dataset_inputs
-                )
-
-    except MlflowException as e:
+        mlflow_run = mlflow_client.get_run(job_name)
+        if mlflow_run and mlflow_run.data:
+            mlflow_metrics = mlflow_run.data.metrics or {}
+            mlflow_params = mlflow_run.data.params or {}
+            mlflow_tags_dict = mlflow_run.data.tags or {}
+            script_name = mlflow_tags_dict.get("mlflow.source.name")
+            logger.info(
+                f"Retrieved {len(mlflow_metrics)} metrics, {len(mlflow_params)} params for MLflow run {job_name}"
+            )
+        if mlflow_run and mlflow_run.info:
+            mlflow_run_id = mlflow_run.info.run_id
+            mlflow_run_name = mlflow_run.info.run_name
+            mlflow_experiment_id = mlflow_run.info.experiment_id
+            mlflow_user_id = mlflow_run.info.user_id
+            mlflow_artifact_uri = mlflow_run.info.artifact_uri
+            mlflow_start_time_ms = mlflow_run.info.start_time
+            mlflow_end_time_ms = mlflow_run.info.end_time
+        if (
+            mlflow_run
+            and hasattr(mlflow_run, "inputs")
+            and hasattr(mlflow_run.inputs, "dataset_inputs")
+        ):
+            mlflow_dataset_inputs = convert_complex_dict(
+                mlflow_run.inputs.dataset_inputs
+            )
+    except MlflowException as e:  # noqa: BLE001
         if "RESOURCE_DOES_NOT_EXIST" in str(e) or (
             "Run with id=" in str(e) and "not found" in str(e)
         ):
@@ -475,20 +329,16 @@ def _process_job_object(job: Job, mlflow_client: MlflowClient) -> Optional[JobMe
             )
         else:
             logger.warning(f"MLflow Error retrieving run for job {job_name}: {e}")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning(
             f"Unexpected Error retrieving MLflow run for job {job_name}: {e}"
         )
 
-    # --- Job Object Data Extraction ---
-    # (Use the SAME getattr logic as before, applied to the 'job' object passed in)
-    # ... (all the getattr calls: job_id, display_name, job_type, status, etc.) ...
     job_id = getattr(job, "id", None)
     display_name = getattr(job, "display_name", job.name)
     job_type = getattr(job, "type", None)
     status = getattr(job, "status", None)
     experiment_name = getattr(job, "experiment_name", None)
-    # Crucially, get parent_job_name from the job object itself
     parent_job_name = getattr(job, "parent_job_name", None)
     description = getattr(job, "description", None)
     tags = getattr(job, "tags", {})
@@ -505,7 +355,6 @@ def _process_job_object(job: Job, mlflow_client: MlflowClient) -> Optional[JobMe
     services = getattr(job, "services", None)
     job_properties = getattr(job, "properties", None)
 
-    # Specific Job Type Fields
     distribution = getattr(job, "distribution", None)
     job_limits = getattr(job, "limits", None)
     task_details = getattr(job, "task_details", None)
@@ -515,11 +364,8 @@ def _process_job_object(job: Job, mlflow_client: MlflowClient) -> Optional[JobMe
     early_termination = getattr(job, "early_termination", None)
     trial_component = getattr(job, "trial", None)
     pipeline_settings = getattr(job, "settings", None)
-    pipeline_sub_jobs = getattr(
-        job, "jobs", None
-    )  # Note: This usually just has keys, not full objects
+    pipeline_sub_jobs = getattr(job, "jobs", None)
 
-    # Environment
     environment_name = None
     environment_id = None
     environment_obj = getattr(job, "environment", None)
@@ -541,14 +387,12 @@ def _process_job_object(job: Job, mlflow_client: MlflowClient) -> Optional[JobMe
             elif isinstance(environment_obj, str):
                 environment_id = str(environment_obj)
 
-    # Compute
     compute_id_from_props = None
     compute_type = None
     if job_properties:
         compute_type = job_properties.get("_azureml.ComputeTargetType")
         compute_id_from_props = job_properties.get("computeId")
 
-    # Resources
     instance_count = None
     instance_type = None
     resources_obj = (
@@ -558,7 +402,6 @@ def _process_job_object(job: Job, mlflow_client: MlflowClient) -> Optional[JobMe
         instance_count = getattr(resources_obj, "instance_count", None)
         instance_type = getattr(resources_obj, "instance_type", None)
 
-    # Creation / Modification Context
     created_at_dt = (
         getattr(job.creation_context, "created_at", None)
         if hasattr(job, "creation_context")
@@ -592,7 +435,6 @@ def _process_job_object(job: Job, mlflow_client: MlflowClient) -> Optional[JobMe
         else None
     )
 
-    # Start/End Time & Duration
     prop_start = job_properties.get("StartTimeUtc") if job_properties else None
     prop_end = job_properties.get("EndTimeUtc") if job_properties else None
     start_time_raw = (
@@ -603,30 +445,23 @@ def _process_job_object(job: Job, mlflow_client: MlflowClient) -> Optional[JobMe
     end_time = safe_isoformat(end_time_raw)
     duration_seconds = safe_duration(start_time_raw, end_time_raw)
 
-    # --- Assemble JobMetadata ---
     jm = JobMetadata(
-        # Core Identifiers
-        name=job_name,  # Use the name from the Job object
+        name=job_name,
         id=job_id,
         display_name=display_name,
         job_type=job_type,
         status=status,
-        # Hierarchy and Context
         experiment_name=experiment_name,
-        parent_job_name=parent_job_name,  # Get directly from job object
-        # Timestamps and Duration
+        parent_job_name=parent_job_name,
         created_at=created_at,
         start_time=start_time,
         end_time=end_time,
         duration_seconds=duration_seconds,
-        # Creator Info
         created_by=created_by,
         created_by_type=created_by_type,
-        # Modification Info
         last_modified_at=last_modified_at,
         last_modified_by=last_modified_by,
         last_modified_by_type=last_modified_by_type,
-        # Execution Details
         command=command,
         script_name=script_name,
         environment_name=environment_name,
@@ -635,13 +470,11 @@ def _process_job_object(job: Job, mlflow_client: MlflowClient) -> Optional[JobMe
         code_id=code_id,
         arguments=None,
         job_parameters=job_parameters,
-        # Compute Details
         compute_target=compute_target_name,
         compute_id=compute_id_from_props,
         compute_type=compute_type,
         instance_count=instance_count,
         instance_type=instance_type,
-        # Job Specific Configuration
         distribution=distribution,
         job_limits=job_limits,
         job_inputs=job_inputs,
@@ -649,20 +482,16 @@ def _process_job_object(job: Job, mlflow_client: MlflowClient) -> Optional[JobMe
         identity_type=identity_type,
         services=services,
         job_properties=job_properties,
-        # AutoML/Sweep Specific
         task_details=task_details,
         objective=objective,
         search_space=search_space,
         sampling_algorithm=sampling_algorithm,
         early_termination=early_termination,
         trial_component=trial_component,
-        # Pipeline Specific
         pipeline_settings=pipeline_settings,
-        pipeline_sub_jobs=pipeline_sub_jobs,  # Still just keys here
-        # Metadata
+        pipeline_sub_jobs=pipeline_sub_jobs,
         description=description,
         tags=tags,
-        # MLflow Specific Data
         mlflow_run_id=mlflow_run_id,
         mlflow_run_name=mlflow_run_name,
         mlflow_experiment_id=mlflow_experiment_id,
@@ -676,373 +505,123 @@ def _process_job_object(job: Job, mlflow_client: MlflowClient) -> Optional[JobMe
     return jm
 
 
-def extract_job_by_name(
-    client: MLClient,
-    job_name: str,
-    automl_max_trials: Optional[int] = None,
-    automl_top_metric: Optional[str] = None,
-    automl_trial_sampling: str = "best",  # best|first|random
-    automl_include_trials: bool = True,
-    download_artifacts: bool = True,
-    include_trial_artifacts: bool = False,
-    artifacts_dir: str = "artifacts_export",
-) -> Iterator[JobMetadata]:
-    """
-    Extract a single top-level job by name
-    AND all its recursively nested child jobs (for pipelines),
-    yielding JobMetadata objects.
-
-    Returns None if the specified job is not found or cannot be processed.
-    """
-    ws_obj = client.workspaces.get(client.workspace_name)
-    mlflow_tracking_uri = getattr(ws_obj, "mlflow_tracking_uri", None)
-    if mlflow_tracking_uri:
-        logger.info(f"Using MLflow tracking URI: {mlflow_tracking_uri}")
-        mlflow.set_tracking_uri(mlflow_tracking_uri)  # type: ignore[arg-type]
-    else:
-        logger.warning(
-            "Workspace has no mlflow_tracking_uri; proceeding without MLflow tracking URI override."
-        )
-    mlflow_client = MlflowClient()
-
-    try:
-        root_job_object: Job = client.jobs.get(name=job_name)  # type: ignore[arg-type]
-    except ResourceNotFoundError:
-        logger.warning(
-            f"Top-level job {job_name} not found in workspace {client.workspace_name}."
-        )
-        return None
-    except Exception as e:
-        logger.error(
-            f"Failed to retrieve full job details for top-level job {job_name}: {e}. Skipping."
-        )
-        return None
-
-    root_metadata = _process_job_object(root_job_object, mlflow_client)
-    if not root_metadata:
-        logger.warning(f"Failed to process top-level job object {job_name}.")
-        return None
-
-    visited: Set[str] = set()
-    visited.add(job_name)
-
-    # Download artifacts for root (always attempt if enabled)
-    if download_artifacts:
-        _download_run_artifacts(
-            mlflow_client,
-            run_id=job_name,
-            artifacts_root=artifacts_dir,
-            warn_if_exists=True,
-        )
-
-    # Always traverse descendants (not only pipelines) to capture AutoML / Sweep / nested structures
-    descendants = _traverse_descendants(
-        client=client,
-        mlflow_client=mlflow_client,
-        root_name=job_name,
-        visited=visited,
-        automl_max_trials=automl_max_trials,
-        automl_top_metric=automl_top_metric,
-        automl_trial_sampling=automl_trial_sampling,
-        automl_include_trials=automl_include_trials,
-        download_artifacts=download_artifacts,
-        include_trial_artifacts=include_trial_artifacts,
-        artifacts_dir=artifacts_dir,
-    )
-
-    # yield root metadata and descendants as a list
-    yield root_metadata
-    yield from descendants
+# -------------------------------
+# Retry helpers
+# -------------------------------
 
 
-def extract_all_jobs(
-    client: MLClient,
-    limit: Optional[int] = None,
-    filter: Optional[
-        list[str]
-    ] = None,  # (kept for backward compatibility / future use)
-    # include_names: Optional[Set[str]] = None,
-    automl_max_trials: Optional[int] = None,
-    automl_top_metric: Optional[str] = None,
-    automl_trial_sampling: str = "best",  # best|first|random
-    automl_include_trials: bool = True,
-    download_artifacts: bool = True,
-    include_trial_artifacts: bool = False,
-    artifacts_dir: str = "artifacts_export",
-) -> Iterator[JobMetadata]:
-    """
-    Extract selected top-level jobs (optionally restricted by include_names)
-    AND all their recursively nested child jobs (for pipelines),
-    yielding JobMetadata objects.
+def _is_transient(ex: Exception) -> bool:
+    msg = str(ex).lower()
+    transient_terms = [
+        "429",
+        "timeout",
+        "temporarily",
+        "rate limit",
+        "unavailable",
+        "503",
+        "502",
+        "connection reset",
+        "timed out",
+    ]
+    return any(t in msg for t in transient_terms)
 
-    include_names:
-        If provided, only top-level jobs whose name is in this set are processed.
-        Their descendants are still fully traversed.
-    """
-    ws_obj = client.workspaces.get(client.workspace_name)
-    mlflow_tracking_uri = getattr(ws_obj, "mlflow_tracking_uri", None)
-    if mlflow_tracking_uri:
-        logger.info(f"Using MLflow tracking URI: {mlflow_tracking_uri}")
-        mlflow.set_tracking_uri(mlflow_tracking_uri)  # type: ignore[arg-type]
-    else:
-        logger.warning(
-            "Workspace has no mlflow_tracking_uri; proceeding without MLflow tracking URI override."
-        )
-    mlflow_client = MlflowClient()
 
-    try:
-        all_job_summaries = list(client.jobs.list())
-    except Exception as e:
-        logger.exception(f"Failed to list initial job summaries: {e}")
-        return
-
-    total_jobs = len(all_job_summaries)
-
-    filtered_summaries = all_job_summaries
-    print(
-        f"Found {total_jobs} total top-level job summaries. Starting extraction including children..."
-    )
-
-    # Apply limit AFTER filtering (cap the number of selected roots)
-    if limit is not None and limit < len(filtered_summaries):
-        print(
-            f"Limiting selected top-level jobs to {limit} (from {len(filtered_summaries)} after filtering)."
-        )
-        job_summaries_to_process = filtered_summaries[:limit]
-    else:
-        job_summaries_to_process = filtered_summaries
-
-    visited: Set[str] = set()
-
-    for job_summary in tqdm(
-        job_summaries_to_process, desc="Processing Top-Level Jobs", unit="job"
-    ):
-        root_job_name = job_summary.name  # SDK should always provide a name
-        if root_job_name is None:  # Defensive
-            logger.warning("Encountered a job summary without a name; skipping.")
-            continue
-        if root_job_name in visited:
-            continue
+def _with_retries(fn, *args, **kwargs):
+    attempts = kwargs.pop("_attempts", 5)
+    for attempt in range(attempts):
         try:
-            root_job_object: Job = client.jobs.get(name=root_job_name)  # type: ignore[arg-type]
-        except ResourceNotFoundError:
+            return fn(*args, **kwargs)
+        except Exception as e:  # noqa: BLE001
+            if attempt == attempts - 1 or not _is_transient(e):
+                raise
+            backoff_base = 0.5
+            sleep_time = min(backoff_base * (2**attempt), 8.0)
+            # jitter
+            sleep_time *= 0.7 + 0.6 * _rand.random()
             logger.warning(
-                f"Top-level job {root_job_name} summary found but GET failed (not found). Skipping."
+                f"Transient error calling {fn.__name__}: {e} (retry {attempt+1}/{attempts} in {sleep_time:.2f}s)"
             )
-            continue
-        except Exception as e:
-            logger.error(
-                f"Failed to retrieve full job details for top-level job {root_job_name}: {e}. Skipping."
-            )
-            continue
-
-        root_metadata = _process_job_object(root_job_object, mlflow_client)
-        if not root_metadata:
-            logger.warning(f"Failed to process top-level job object {root_job_name}.")
-            continue
-
-        visited.add(root_job_name)
-        yield root_metadata
-
-        # Download artifacts for root (always attempt if enabled)
-        if download_artifacts:
-            _download_run_artifacts(
-                mlflow_client,
-                run_id=root_job_name,
-                artifacts_root=artifacts_dir,
-                warn_if_exists=True,
-            )
-
-        # Always traverse descendants (not only pipelines) to capture AutoML / Sweep / nested structures
-        yield from _traverse_descendants(
-            client=client,
-            mlflow_client=mlflow_client,
-            root_name=root_job_name,
-            visited=visited,
-            automl_max_trials=automl_max_trials,
-            automl_top_metric=automl_top_metric,
-            automl_trial_sampling=automl_trial_sampling,
-            automl_include_trials=automl_include_trials,
-            download_artifacts=download_artifacts,
-            include_trial_artifacts=include_trial_artifacts,
-            artifacts_dir=artifacts_dir,
-        )
+            time.sleep(sleep_time)
 
 
-def _traverse_descendants(
+# -------------------------------
+# Concurrency job processor
+# -------------------------------
+
+
+def _process_single_job(
     client: MLClient,
     mlflow_client: MlflowClient,
-    root_name: str,
+    job_name: str,
+    collect_artifacts: bool,
     visited: Set[str],
-    automl_max_trials: Optional[int],
-    automl_top_metric: Optional[str],
-    automl_trial_sampling: str,
-    automl_include_trials: bool,
-    download_artifacts: bool,
-    include_trial_artifacts: bool,
-    artifacts_dir: str,
-) -> Iterator[JobMetadata]:
-    """Generic depth-first traversal of all descendant jobs (pipelines, AutoML, sweeps, etc.)."""
-    stack: List[str] = [root_name]
+    visited_lock: Optional[Lock],
+) -> Tuple[Optional[JobMetadata], List[str]]:
+    try:
+        job_obj: Job = _with_retries(client.jobs.get, name=job_name)  # type: ignore[arg-type]
+    except ResourceNotFoundError:
+        logger.warning(f"Job {job_name} not found during processing.")
+        return None, []
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"Failed job GET for {job_name}: {e}")
+        return None, []
 
-    while stack:
-        current_parent = stack.pop()
+    meta = _process_job_object(job_obj, mlflow_client)
+    if not meta:
+        return None, []
 
-        # Fetch parent to detect type & properties
+    if collect_artifacts and meta.mlflow_run_id:
         try:
-            parent_job_obj: Job = client.jobs.get(name=current_parent)
-            parent_type_raw = getattr(parent_job_obj, "type", "") or ""
-            parent_type = parent_type_raw.lower()
-            parent_properties = getattr(parent_job_obj, "properties", {}) or {}
-            parent_tags = getattr(parent_job_obj, "tags", {}) or {}
-        except Exception:
-            parent_type = ""
-            parent_properties = {}
-            parent_tags = {}
+            paths = _list_artifact_file_paths(mlflow_client, meta.mlflow_run_id)
+            meta.mlflow_artifact_paths = paths if paths else []
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"Artifact path listing failed for run {meta.mlflow_run_id}: {e}"
+            )
 
-        try:
-            child_job_summaries = list(client.jobs.list(parent_job_name=current_parent))
-        except Exception as e:
-            logger.error(f"Failed to list child jobs for parent {current_parent}: {e}")
-            continue
+    # Children
+    try:
+        child_summaries = _with_retries(client.jobs.list, parent_job_name=job_name)
+        child_summaries = child_summaries or []  # type: ignore[assignment]
+        child_names = [
+            c.name  # type: ignore[attr-defined]
+            for c in child_summaries
+            if getattr(c, "name", None) is not None
+        ]
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"Failed to list children for {job_name}: {e}")
+        child_names = []
 
-        if not child_job_summaries:
-            continue
+    new_children: List[str] = []
+    if visited_lock:
+        with visited_lock:
+            for cn in child_names:
+                if cn is None:
+                    continue
+                if cn not in visited:
+                    visited.add(cn)
+                    new_children.append(cn)
+    else:
+        for cn in child_names:
+            if cn is None:
+                continue
+            if cn not in visited:
+                visited.add(cn)
+                new_children.append(cn)
+    return meta, new_children
 
-        logger.info(
-            f"Found {len(child_job_summaries)} child jobs for parent '{current_parent}'."
+
+def _init_mlflow(client: MLClient) -> MlflowClient:
+    ws_obj = client.workspaces.get(client.workspace_name)
+    mlflow_tracking_uri = getattr(ws_obj, "mlflow_tracking_uri", None)
+    if mlflow_tracking_uri:
+        logger.info(f"Using MLflow tracking URI: {mlflow_tracking_uri}")
+        mlflow.set_tracking_uri(mlflow_tracking_uri)  # type: ignore[arg-type]
+    else:
+        logger.warning(
+            "Workspace has no mlflow_tracking_uri; proceeding without MLflow tracking URI override."
         )
-
-        processed_children: List[JobMetadata] = []
-        for child_summary in child_job_summaries:
-            child_name = child_summary.name
-            if child_name is None:
-                logger.warning(
-                    f"Encountered child summary without name under parent {current_parent}; skipping."
-                )
-                continue
-            if child_name in visited:
-                continue
-            try:
-                child_job_object: Job = client.jobs.get(name=child_name)
-            except ResourceNotFoundError:
-                logger.warning(
-                    f"Child job {child_name} listed but GET failed (not found) for parent {current_parent}. Skipping."
-                )
-                continue
-            except Exception as e:
-                logger.error(
-                    f"Failed to retrieve full details for child job {child_name} (parent {current_parent}): {e}"
-                )
-                continue
-            child_metadata = _process_job_object(child_job_object, mlflow_client)
-            if not child_metadata:
-                logger.warning(
-                    f"Failed to process child job object {child_name} (parent {current_parent})."
-                )
-                continue
-            if child_metadata.parent_job_name != current_parent:
-                child_metadata.parent_job_name = current_parent
-            processed_children.append(child_metadata)
-
-        # Detect AutoML parent (can present as type 'automl' OR a step with runTemplate AutoML / StepType AutoMLStep)
-        is_automl_parent = False
-        if parent_type == "automl":
-            is_automl_parent = True
-        else:
-            run_template = parent_properties.get("runTemplate")
-            step_type = parent_properties.get("StepType")
-            pipeline_component = parent_properties.get("azureml.pipelineComponent", "")
-            if (
-                run_template == "AutoML"
-                or step_type == "AutoMLStep"
-                or pipeline_component.startswith("masterautoml")
-                or "automl_best_child_run_id" in parent_tags
-            ):
-                is_automl_parent = True
-
-        if is_automl_parent:
-            if not automl_include_trials:
-                logger.info(
-                    f"AutoML trials excluded for parent {current_parent}; skipping its child trials."
-                )
-                # Still yield the AutoML parent itself (already yielded earlier) – skip its children
-                continue
-            if processed_children:
-                primary_metric = automl_top_metric
-                if not primary_metric:
-                    for cm in processed_children:
-                        if cm.mlflow_metrics:
-                            for k, v in cm.mlflow_metrics.items():
-                                if isinstance(v, (int, float)):
-                                    primary_metric = k
-                                    break
-                        if primary_metric:
-                            break
-                scored = []
-                unscored = []
-                for cm in processed_children:
-                    val = None
-                    if primary_metric and cm.mlflow_metrics:
-                        metric_val = cm.mlflow_metrics.get(primary_metric)
-                        if isinstance(metric_val, (int, float)):
-                            val = float(metric_val)
-                    if val is not None:
-                        scored.append((val, cm))
-                    else:
-                        unscored.append(cm)
-                if automl_trial_sampling == "first":
-                    selected_children = processed_children
-                elif automl_trial_sampling == "random":
-                    random.shuffle(processed_children)
-                    selected_children = processed_children
-                else:  # best
-                    if scored:
-                        scored.sort(key=lambda x: x[0], reverse=True)
-                        ordered = [c for _, c in scored] + unscored
-                        selected_children = ordered
-                    else:
-                        selected_children = processed_children
-                if (
-                    automl_max_trials is not None
-                    and len(selected_children) > automl_max_trials
-                ):
-                    logger.info(
-                        f"AutoML trial cap: keeping top {automl_max_trials} of {len(selected_children)} for parent {current_parent}."
-                    )
-                    selected_children = selected_children[:automl_max_trials]
-                processed_children = selected_children
-
-        # Yield children and push each onto stack for further traversal (generic approach)
-        for child_metadata in processed_children:
-            child_name = child_metadata.name
-            if child_name is None:
-                logger.warning(
-                    f"Child job of parent {current_parent} has no name; skipping."
-                )
-                continue
-            if child_name in visited:
-                continue
-            visited.add(child_name)
-            yield child_metadata
-            # Artifacts: only for trials if include_trial_artifacts, always for non-trial descendants
-            if download_artifacts:
-                is_trial = (
-                    is_automl_parent
-                    and child_metadata.parent_job_name == current_parent
-                )
-                if not is_trial or (is_trial and include_trial_artifacts):
-                    _download_run_artifacts(
-                        mlflow_client,
-                        run_id=child_name,
-                        artifacts_root=artifacts_dir,
-                        warn_if_exists=True,
-                    )
-            # Always attempt further traversal (cheap if no children)
-            stack.append(child_name)
-
-
-# --- Main Execution ---
+    return MlflowClient()
 
 
 def main(
@@ -1050,173 +629,149 @@ def main(
     output_path: str,
     limit: Optional[int] = None,
     include_names: Optional[Set[str]] = None,
-    automl_max_trials: Optional[int] = None,
-    automl_top_metric: Optional[str] = None,
-    automl_trial_sampling: str = "best",
-    automl_include_trials: bool = True,
-    download_artifacts: bool = True,
-    include_trial_artifacts: bool = False,
-    artifacts_dir: str = "artifacts_export",
+    parallel: int = 1,
+    include_artifacts: bool = True,
 ):
     setup_logging()
     try:
-        source_client = get_ml_client(source_config)
-        print(f"Connected to workspace: {source_client.workspace_name}")
-    except Exception as e:
+        client = get_ml_client(source_config)
+        print(f"Connected to workspace: {client.workspace_name}")
+    except Exception as e:  # noqa: BLE001
         logger.error(
             f"Failed to connect to source workspace using config {source_config}: {e}"
         )
         return
 
-    output_dir = os.path.dirname(output_path)
-    if output_dir:
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
         try:
-            os.makedirs(output_dir, exist_ok=True)
+            os.makedirs(out_dir, exist_ok=True)
         except OSError as e:
-            logger.error(f"Failed to create output directory {output_dir}: {e}")
+            logger.error(f"Failed to create output directory {out_dir}: {e}")
             return
 
-    job_count = 0
-    first_item = True
-    missing_requested: list[str] = []
+    mlflow_client = _init_mlflow(client)
+    visited: Set[str] = set()
+    missing_requested: List[str] = []
 
+    # Determine root job names
+    if include_names:
+        root_names = list(include_names)
+        print(
+            f"Extracting {len(root_names)} specified top-level job(s) and descendants..."
+        )
+    else:
+        try:
+            summaries_iter = _with_retries(client.jobs.list)
+            summaries = list(summaries_iter) if summaries_iter else []
+        except Exception as e:  # noqa: BLE001
+            logger.exception(f"Failed to list top-level jobs: {e}")
+            return
+        total = len(summaries)
+        if limit is not None and limit < total:
+            summaries = summaries[:limit]
+            print(f"Found {total} top-level jobs. Limiting to first {limit}.")
+        else:
+            print(f"Found {total} top-level jobs.")
+        root_names = [s.name for s in summaries if getattr(s, "name", None)]
+        print("Extracting all selected top-level jobs and their descendants...")
+
+    job_count = 0
+    results: List[JobMetadata] = []
+
+    # Seed visited with roots
+    for rn in root_names:
+        if rn:
+            visited.add(rn)
+
+    start_time = time.time()
+
+    if parallel <= 1:
+        queue = deque(root_names)
+        while queue:
+            name = queue.popleft()
+            if not name:
+                continue
+            meta, children = _process_single_job(
+                client,
+                mlflow_client,
+                name,
+                include_artifacts,
+                visited,
+                visited_lock=None,
+            )
+            if meta:
+                results.append(meta)
+                job_count += 1
+            for c in children:
+                queue.append(c)
+    else:
+        parallel = max(1, parallel)
+        visited_lock = Lock()
+        executor = ThreadPoolExecutor(max_workers=parallel)
+        futures: Set[Future] = set()
+
+        def submit(name: str):
+            futures.add(
+                executor.submit(
+                    _process_single_job,
+                    client,
+                    mlflow_client,
+                    name,
+                    include_artifacts,
+                    visited,
+                    visited_lock,
+                )
+            )
+
+        for rn in root_names:
+            if rn:
+                submit(rn)
+
+        while futures:
+            done, futures = wait(futures, return_when=FIRST_COMPLETED)
+            for fut in done:
+                try:
+                    meta, children = fut.result()
+                except Exception as e:  # noqa: BLE001
+                    logger.error(f"Worker failed: {e}")
+                    continue
+                if meta:
+                    results.append(meta)
+                    job_count += 1
+                for child in children:
+                    submit(child)
+        executor.shutdown(wait=True)
+
+    elapsed = time.time() - start_time
+
+    # Persist results
     try:
         with open(output_path, "w", encoding="utf-8") as f:
-            f.write("[")
-            if include_names:
-                print(
-                    f"Extracting {len(include_names)} specified top-level job(s) and their descendants..."
-                )
-                for name in include_names:
-                    # Attempt extraction of this explicit job name
-                    produced_any = False
-                    for job_metadata in (
-                        extract_job_by_name(
-                            source_client,
-                            job_name=name,
-                            automl_max_trials=automl_max_trials,
-                            automl_top_metric=automl_top_metric,
-                            automl_trial_sampling=automl_trial_sampling,
-                            automl_include_trials=automl_include_trials,
-                            download_artifacts=download_artifacts,
-                            include_trial_artifacts=include_trial_artifacts,
-                            artifacts_dir=artifacts_dir,
-                        )
-                        or []
-                    ):
-                        produced_any = True
-                        if not first_item:
-                            f.write(",\n")
-                        else:
-                            first_item = False
-                        f.write(json.dumps(job_metadata.to_dict(), indent=2))
-                        job_count += 1
-                    if not produced_any:
-                        # Record missing after attempted retrieval
-                        missing_requested.append(name)
-            else:
-                print("Extracting all top-level jobs and their descendants...")
-                for job_metadata in extract_all_jobs(
-                    source_client,
-                    limit=limit,
-                    automl_max_trials=automl_max_trials,
-                    automl_top_metric=automl_top_metric,
-                    automl_trial_sampling=automl_trial_sampling,
-                    automl_include_trials=automl_include_trials,
-                    download_artifacts=download_artifacts,
-                    include_trial_artifacts=include_trial_artifacts,
-                    artifacts_dir=artifacts_dir,
-                ):
-                    if not first_item:
-                        f.write(",\n")
-                    else:
-                        first_item = False
-                    f.write(json.dumps(job_metadata.to_dict(), indent=2))
-                    job_count += 1
-            f.write("]\n")
+            json.dump([m.to_dict() for m in results], f, indent=2)
+    except IOError as e:
+        logger.error(f"Failed to write to output file {output_path}: {e}")
+        return
 
-        if include_names and missing_requested:
+    if include_names:
+        missing_requested_list_raw = [
+            n for n in root_names if all(m.name != n for m in results)
+        ]
+        missing_requested_list: List[str] = [n for n in missing_requested_list_raw if n]
+        missing_requested = missing_requested_list
+        if missing_requested:
             logger.warning(
                 f"{len(missing_requested)} requested top-level job name(s) not found and were skipped: {missing_requested}"
             )
 
-        print(
-            f"\nSuccessfully extracted {job_count} total jobs (including descendants) to {output_path}"
-        )
-
-    except IOError as e:
-        logger.error(f"Failed to write to output file {output_path}: {e}")
-    except Exception as e:
-        logger.exception(f"An unexpected error occurred during extraction: {e}")
+    print(
+        f"\nSuccessfully extracted {job_count} total jobs (including descendants) to {output_path} in {elapsed:.2f}s (parallel={parallel})"
+    )
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Extract AzureML job metadata (including (nested) pipeline children) to JSON"
-    )
-    parser.add_argument(
-        "--source", required=True, help="Path to source workspace config JSON"
-    )
-    parser.add_argument("--output", required=True, help="Path to output JSON file")
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Optional limit on number of TOP-LEVEL jobs to process (after filtering).",
-    )
-    parser.add_argument(
-        "--include",
-        help="Comma-separated list of top-level job names to include (exact match).",
-    )
-    parser.add_argument(
-        "--include-file",
-        help="Path to a text file with one top-level job name per line to include.",
-    )
-    parser.add_argument(
-        "--automl-max-trials",
-        type=int,
-        default=None,
-        help="Limit number of AutoML trial child jobs per AutoML parent (after ranking).",
-    )
-    parser.add_argument(
-        "--automl-top-metric",
-        type=str,
-        default=None,
-        help="Primary metric name to rank AutoML trials; if omitted, inferred from first numeric metric encountered.",
-    )
-    parser.add_argument(
-        "--automl-trial-sampling",
-        type=str,
-        choices=["best", "first", "random"],
-        default="best",
-        help="Sampling strategy for selecting AutoML trials when limiting: best (by metric), first (original order), random (shuffle).",
-    )
-    parser.add_argument(
-        "--no-automl-trials",
-        action="store_true",
-        help="Exclude AutoML trial child jobs entirely; only export parent AutoML job metadata.",
-    )
-    parser.add_argument(
-        "--no-artifacts",
-        action="store_true",
-        help="Skip downloading MLflow artifacts (by default artifacts are downloaded).",
-    )
-    parser.add_argument(
-        "--artifacts-dir",
-        type=str,
-        default="artifacts_export",
-        help="Directory root where run artifact folders will be stored (one subfolder per run id).",
-    )
-    parser.add_argument(
-        "--include-trial-artifacts",
-        action="store_true",
-        help="Also download artifacts for AutoML trial runs (when trials are included).",
-    )
-    args = parser.parse_args()
-
+def _parse_include_args(args) -> Optional[Set[str]]:
     include_names: Optional[Set[str]] = set()
     if args.include:
-        # Heuristic: user accidentally passed a file path to --include
         inc_clean = args.include.strip()
         if (
             inc_clean
@@ -1225,8 +780,7 @@ if __name__ == "__main__":
             and inc_clean.lower().endswith((".txt", ".list", ".csv"))
         ):
             logger.warning(
-                f"--include looks like a file path '{inc_clean}'. "
-                f"Did you mean to use --include-file {inc_clean}?"
+                f"--include looks like a file path '{inc_clean}'. Did you mean to use --include-file {inc_clean}?"
             )
         include_names.update(n.strip() for n in args.include.split(",") if n.strip())
     if args.include_file:
@@ -1238,20 +792,52 @@ if __name__ == "__main__":
                         include_names.add(name)
         except OSError as e:
             print(f"WARNING: Failed to read include file '{args.include_file}': {e}")
-
     if not include_names:
-        include_names = None  # Pass None instead of empty set for clarity
+        return None
+    return include_names
 
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Extract AzureML job metadata (including nested pipeline children) to JSON"
+    )
+    parser.add_argument(
+        "--source", required=True, help="Path to source workspace config JSON"
+    )
+    parser.add_argument("--output", required=True, help="Path to output JSON file")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Optional limit on number of TOP-LEVEL jobs to process.",
+    )
+    parser.add_argument(
+        "--include",
+        help="Comma-separated list of top-level job names to include (exact match).",
+    )
+    parser.add_argument(
+        "--include-file",
+        help="Path to a text file with one top-level job name per line to include.",
+    )
+    parser.add_argument(
+        "--parallel",
+        type=int,
+        default=1,
+        help="Max number of concurrent job processing workers (default 1 = sequential).",
+    )
+    parser.add_argument(
+        "--no-artifacts",
+        action="store_true",
+        help="Skip artifact path manifest enumeration (faster).",
+    )
+
+    args = parser.parse_args()
+    include_names = _parse_include_args(args)
     main(
-        args.source,
-        args.output,
-        args.limit,
+        source_config=args.source,
+        output_path=args.output,
+        limit=args.limit,
         include_names=include_names,
-        automl_max_trials=args.automl_max_trials,
-        automl_top_metric=args.automl_top_metric,
-        automl_trial_sampling=args.automl_trial_sampling,
-        automl_include_trials=not args.no_automl_trials,
-        download_artifacts=not args.no_artifacts,
-        include_trial_artifacts=args.include_trial_artifacts,
-        artifacts_dir=args.artifacts_dir,
+        parallel=max(1, args.parallel),
+        include_artifacts=not args.no_artifacts,
     )

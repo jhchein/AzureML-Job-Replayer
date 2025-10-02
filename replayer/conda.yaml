@@ -7,3 +7,4 @@ dependencies:
   - pip:
     - mlflow
     - azureml-mlflow
+    - azure-storage-blob

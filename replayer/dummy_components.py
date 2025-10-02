@@ -6,7 +6,7 @@ from azure.ai.ml.entities import Environment
 # Assuming conda.yaml is correctly located relative to the project root
 # when running with 'python -m'
 DUMMY_ENV_NAME = "dummy-env"
-DUMMY_ENV_VERSION = "1.1.0"
+DUMMY_ENV_VERSION = "1.2.0"
 DUMMY_ENV_CONDA_PATH = "replayer/conda.yaml"  # Path relative to project root
 
 DUMMY_ENV = Environment(
@@ -26,9 +26,9 @@ replay_metrics_component = command(
     inputs={
         "original_job_id": "string",
         "metrics_file": Input(type=AssetTypes.URI_FILE),
-        "artifacts_dir": Input(type=AssetTypes.URI_FOLDER, optional=True),
+        "artifact_manifest": Input(type=AssetTypes.URI_FILE),
     },
     code="./replayer/component_code",
-    command='python log_metrics.py --job-id "${{inputs.original_job_id}}" --metrics-file ${{inputs.metrics_file}} --artifacts-dir ${{inputs.artifacts_dir}}',
-    environment=REGISTERED_ENV_ID,
+    command="python log_metrics.py --job-id ${{inputs.original_job_id}} --metrics-file ${{inputs.metrics_file}} --artifact-manifest ${{inputs.artifact_manifest}} --copy-artifacts",
+    environment=DUMMY_ENV,
 )
