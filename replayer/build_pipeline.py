@@ -5,8 +5,8 @@ import os
 import shutil
 import tempfile
 import uuid
-from typing import Dict, List, Optional, Tuple, Set, Any
-import random
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from azure.ai.ml import (
     Input,
@@ -18,6 +18,12 @@ from azure.ai.ml.entities import (
     UserIdentityConfiguration,
 )
 from azure.core.exceptions import HttpResponseError
+from azure.identity import AzureCliCredential
+from azure.storage.blob import (
+    BlobServiceClient,
+    ContainerSasPermissions,
+    generate_container_sas,
+)
 
 from extractor.extract_jobs import JobMetadata
 from replayer.dummy_components import (
@@ -44,6 +50,8 @@ REPLAY_STANDALONE_TAG = "replay_standalone"
 ORIGINAL_JOB_ID_TAG = "original_job_id"
 REPLAY_TYPE_TAG = "replay_type"
 DUMMY_REPLAY_VALUE = "dummy_metrics_replay"
+ORIGINAL_PARENT_PIPELINE_ID_TAG = "original_parent_pipeline_id"
+PIPELINE_DEPTH_TAG = "original_pipeline_depth"
 
 
 def _index_jobs(jobs: List[JobMetadata]):
@@ -99,158 +107,26 @@ def build_dummy_pipeline_for_children(
     temp_dir_path: str,
     *,
     children_map: Dict[str, List[JobMetadata]],
-    jobs_by_name: Dict[str, JobMetadata],
-    expand_automl_trials: bool = False,
-    replay_automl_max_trials: Optional[int] = None,
-    replay_automl_top_metric: Optional[str] = None,
-    replay_automl_trial_sampling: str = "best",  # best|first|random
-    artifacts_dir: Optional[str] = None,
-    upload_artifacts: bool = True,
-    include_trial_artifacts: bool = False,
+    manifest_paths: Optional[Dict[str, str]] = None,
+    disable_automl_expansion: bool = True,
 ) -> Optional[PipelineJob]:
+    """Build a pipeline job containing ONLY direct non-pipeline child steps (leaf command jobs) of parent_job.
+
+    Nested pipeline children are not flattened; they will be replayed as their own PipelineJobs separately
+    and linked via tags. This preserves the original multi-level hierarchy.
+    """
     if not child_jobs:
         return None
 
-    def is_automl_parent(jm: JobMetadata) -> bool:
-        if not jm:
-            return False
-        props = jm.job_properties or {}
-        tags = jm.tags or {}
-        jt = (jm.job_type or "").lower()
-        if jt == "automl":
-            return True
-        if props.get("runTemplate") == "AutoML":
-            return True
-        if props.get("StepType") == "AutoMLStep":
-            return True
-        if props.get("azureml.pipelineComponent", "").startswith("masterautoml"):
-            return True
-        if "automl_best_child_run_id" in tags:
-            return True
-        return False
-
-    def select_trials(trials: List[JobMetadata]) -> List[JobMetadata]:
-        if not trials:
-            return []
-        primary_metric = replay_automl_top_metric
-        # Infer metric if not provided
-        if not primary_metric:
-            for t in trials:
-                if t.mlflow_metrics:
-                    for k, v in t.mlflow_metrics.items():
-                        if isinstance(v, (int, float)):
-                            primary_metric = k
-                            break
-                if primary_metric:
-                    break
-        if replay_automl_trial_sampling == "first" or not primary_metric:
-            ordered = trials
-        elif replay_automl_trial_sampling == "random":
-            ordered = trials[:]
-            random.shuffle(ordered)
-        else:  # best
-            scored: List[Tuple[float, JobMetadata]] = []
-            unscored: List[JobMetadata] = []
-            for t in trials:
-                mv = (
-                    t.mlflow_metrics.get(primary_metric)
-                    if t.mlflow_metrics and primary_metric in t.mlflow_metrics
-                    else None
-                )
-                if isinstance(mv, (int, float)):
-                    scored.append((float(mv), t))
-                else:
-                    unscored.append(t)
-            if scored:
-                # Assume higher is better (could parse goal later)
-                scored.sort(key=lambda x: x[0], reverse=True)
-                ordered = [t for _, t in scored] + unscored
-            else:
-                ordered = trials
-        if (
-            replay_automl_max_trials is not None
-            and len(ordered) > replay_automl_max_trials
-        ):
-            print(
-                f" -> AutoML trial cap: trimming from {len(ordered)} to {replay_automl_max_trials} trials."
-            )
-            ordered = ordered[:replay_automl_max_trials]
-        return ordered
-
-    def gather_all_descendants(root_name: str) -> List[JobMetadata]:
-        """Return all descendant jobs (recursive) under a given job name."""
-        collected: List[JobMetadata] = []
-        stack = list(children_map.get(root_name, []))
-        while stack:
-            node = stack.pop()
-            collected.append(node)
-            stack.extend(children_map.get(node.name, []))
-        return collected
-
-    # Build structured list of effective steps with roles & metadata.
-    # Each element: { 'meta': JobMetadata, 'role': 'normal'|'automl_parent'|'automl_trial',
-    #                 'parent_name': <str or None>, 'rank': <int or None>,
-    #                 'total_trials': <int or None>, 'selected_trials': <int or None>,
-    #                 'primary_metric': <str or None>, 'is_best': <bool or None> }
+    # Filter only leaf (non-pipeline) children for inclusion as steps.
     effective_children: List[Dict[str, Any]] = []
     for child in child_jobs:
-        if expand_automl_trials and is_automl_parent(child):
-            direct_candidates = children_map.get(child.name, [])
-            deep_desc = gather_all_descendants(child.name)
-            leaf_desc = [d for d in deep_desc if not children_map.get(d.name)]
-            # Prefer leaves; if none (unlikely) fall back to direct children list
-            trials = leaf_desc if leaf_desc else direct_candidates
-            if trials:
-                print(
-                    f" -> Expanding AutoML parent '{child.display_name or child.name}': {len(trials)} candidate trial(s) (direct={len(direct_candidates)}, leaves={len(leaf_desc)})."
-                )
-                selected = select_trials(trials)
-                print(
-                    f"    -> Selected {len(selected)} trial(s) after sampling/limits."
-                )
-                total_trials = len(trials)
-                selected_count = len(selected)
-                # Add parent first (always retained now)
-                effective_children.append(
-                    {
-                        "meta": child,
-                        "role": "automl_parent",
-                        "parent_name": parent_job.name,
-                        "rank": None,
-                        "total_trials": total_trials,
-                        "selected_trials": selected_count,
-                        "primary_metric": replay_automl_top_metric,
-                        "is_best": False,
-                    }
-                )
-                # Trials ordered as returned by select_trials (deterministic under 'best')
-                for idx, tmeta in enumerate(selected, start=1):
-                    effective_children.append(
-                        {
-                            "meta": tmeta,
-                            "role": "automl_trial",
-                            "parent_name": child.name,
-                            "rank": idx,
-                            "total_trials": total_trials,
-                            "selected_trials": selected_count,
-                            "primary_metric": replay_automl_top_metric,
-                            "is_best": idx == 1,
-                        }
-                    )
-                continue  # skip default append
-        # Non-AutoML or not expanding
-        effective_children.append(
-            {
-                "meta": child,
-                "role": "normal",
-                "parent_name": parent_job.name,
-                "rank": None,
-                "total_trials": None,
-                "selected_trials": None,
-                "primary_metric": None,
-                "is_best": False,
-            }
-        )
+        jt = (child.job_type or "").lower()
+        if jt == "pipeline":
+            # Defer to separate replay; skip flattening
+            continue
+        # AutoML parents treated as normal single steps when disable_automl_expansion True
+        effective_children.append({"meta": child, "role": "normal"})
 
     pipeline_steps_dict = {}
     for step_info in effective_children:
@@ -266,33 +142,35 @@ def build_dummy_pipeline_for_children(
             print(f"ERROR: Failed to write temp metrics file {temp_filepath}: {e}")
             continue
 
+        manifest_path = None
+        if manifest_paths:
+            manifest_path = manifest_paths.get(step_job_meta.name)
+        if not manifest_path:
+            # Create disabled manifest if absent
+            fd, manifest_path = tempfile.mkstemp(suffix="_disabled_manifest.json")
+            with os.fdopen(fd, "w", encoding="utf-8") as mf:
+                json.dump(
+                    {
+                        "schema_version": 1,
+                        "disabled": True,
+                        "original_run_id": step_job_meta.name,
+                        "relative_paths": [],
+                    },
+                    mf,
+                )
+
         step_inputs = dict(
             original_job_id=step_job_meta.name,
             metrics_file=Input(type=AssetTypes.URI_FILE, path=temp_filepath),
+            artifact_manifest=Input(type=AssetTypes.URI_FILE, path=manifest_path),
         )
         # Attach artifacts if enabled
-        if upload_artifacts and artifacts_dir:
-            # Determine if this is an automl trial and whether it's included
-            is_trial = step_info["role"] == "automl_trial"
-            if (not is_trial) or (is_trial and include_trial_artifacts):
-                run_artifacts_path = os.path.join(artifacts_dir, step_job_meta.name)
-                if os.path.isdir(run_artifacts_path):
-                    step_inputs["artifacts_dir"] = Input(
-                        type=AssetTypes.URI_FOLDER, path=run_artifacts_path
-                    )
-                elif is_trial and not include_trial_artifacts:
-                    pass
+        # (artifacts_dir temporarily disabled in component for debugging quoting issue)
         step = replay_metrics_component(**step_inputs)
 
         # Naming strategy
         base_display = step_job_meta.display_name or step_job_meta.name
-        if step_info["role"] == "automl_parent":
-            base_name_core = f"automl_parent_{step_job_meta.name[:8]}"
-        elif step_info["role"] == "automl_trial":
-            rank = step_info.get("rank") or 0
-            base_name_core = f"automl_trial_{rank:03d}_{step_job_meta.name[:8]}"
-        else:
-            base_name_core = base_display
+        base_name_core = base_display
 
         sanitized_step_key = "".join(
             c if c.isalnum() or c in ["-", "_"] else "_" for c in base_name_core[:60]
@@ -303,37 +181,11 @@ def build_dummy_pipeline_for_children(
             final_key = f"{sanitized_step_key}_{count}"
             count += 1
         step.name = final_key
-        if step_info["role"] == "automl_parent":
-            step.display_name = f"replay_automl_parent_{base_display}"
-        elif step_info["role"] == "automl_trial":
-            rank = step_info.get("rank") or 0
-            step.display_name = f"replay_automl_trial_{rank:03d}_{base_display}"
-        else:
-            step.display_name = f"replay_{base_display}"
+        step.display_name = f"replay_{base_display}"
 
         step.tags = step_job_meta.tags.copy() if step_job_meta.tags else {}
         step.tags[ORIGINAL_JOB_ID_TAG] = step_job_meta.name
         step.tags["original_parent_job_id"] = parent_job.name
-        if step_info["role"].startswith("automl"):
-            step.tags["expanded_automl_trial"] = "true"
-            step.tags["automl_role"] = step_info["role"]
-            if step_info["role"] == "automl_trial":
-                if step_info.get("rank") is not None:
-                    step.tags["automl_trial_rank"] = str(step_info["rank"])
-                if step_info.get("is_best"):
-                    step.tags["automl_best_trial"] = "true"
-                step.tags["automl_parent_id"] = (
-                    step_info.get("parent_name") or parent_job.name
-                )
-            elif step_info["role"] == "automl_parent":
-                if step_info.get("total_trials") is not None:
-                    step.tags["automl_total_trials"] = str(step_info["total_trials"])
-                if step_info.get("selected_trials") is not None:
-                    step.tags["automl_expanded_trials_count"] = str(
-                        step_info["selected_trials"]
-                    )
-                if step_info.get("primary_metric"):
-                    step.tags["automl_metric_primary"] = step_info["primary_metric"]
 
         pipeline_steps_dict[final_key] = step
 
@@ -341,16 +193,17 @@ def build_dummy_pipeline_for_children(
         print("Warning: No steps added to pipeline, possibly due to file errors.")
         return None
 
+    base_tags = {
+        ORIGINAL_JOB_ID_TAG: parent_job.name,
+        REPLAY_TYPE_TAG: DUMMY_REPLAY_VALUE,
+        **(parent_job.tags or {}),
+    }
     pipeline_job_object = PipelineJob(
         jobs=pipeline_steps_dict,
         settings=PipelineJobSettings(default_compute="serverless"),
         display_name=f"Replay of {parent_job.display_name or parent_job.name}",
         description=f"Dummy replay of pipeline {parent_job.name}. Original Desc: {parent_job.description or ''}",
-        tags={
-            ORIGINAL_JOB_ID_TAG: parent_job.name,
-            REPLAY_TYPE_TAG: DUMMY_REPLAY_VALUE,
-            **(parent_job.tags or {}),
-        },
+        tags=base_tags,
         experiment_name=parent_job.experiment_name or "replayed_jobs",
         identity=UserIdentityConfiguration(),
     )
@@ -360,23 +213,36 @@ def build_dummy_pipeline_for_children(
 def build_dummy_standalone_job(
     original_job: JobMetadata,
     metrics_file_path: str,
+    # *,
+    # artifacts_dir: Optional[str] = None,
+    # upload_artifacts: bool = True,
     *,
-    artifacts_dir: Optional[str] = None,
-    upload_artifacts: bool = True,
+    artifact_manifest_path: Optional[str] = None,
 ):
     """
     Builds a dummy CommandJob using a pre-existing metrics file path.
     """
     # Metrics file is already created by the caller
 
+    if not artifact_manifest_path:
+        fd, artifact_manifest_path = tempfile.mkstemp(suffix="_disabled_manifest.json")
+        with os.fdopen(fd, "w", encoding="utf-8") as mf:
+            json.dump(
+                {
+                    "schema_version": 1,
+                    "disabled": True,
+                    "original_run_id": original_job.name,
+                    "relative_paths": [],
+                },
+                mf,
+            )
+
     inputs = dict(
         original_job_id=original_job.name,
         metrics_file=Input(type=AssetTypes.URI_FILE, path=metrics_file_path),
+        artifact_manifest=Input(type=AssetTypes.URI_FILE, path=artifact_manifest_path),
     )
-    if upload_artifacts and artifacts_dir:
-        run_dir = os.path.join(artifacts_dir, original_job.name)
-        if os.path.isdir(run_dir):
-            inputs["artifacts_dir"] = Input(type=AssetTypes.URI_FOLDER, path=run_dir)
+    # (artifacts_dir temporarily disabled in component for debugging quoting issue)
     job = replay_metrics_component(**inputs)
 
     # Apply runtime settings
@@ -395,9 +261,29 @@ def build_dummy_standalone_job(
     return job
 
 
+def build_container_sas(service: BlobServiceClient, container: str, hours: int = 4):
+    start = datetime.now(timezone.utc) - timedelta(minutes=5)
+    expiry = datetime.now(timezone.utc) + timedelta(hours=hours)
+    try:
+        udk = service.get_user_delegation_key(start, expiry)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(
+            "Failed to get user delegation key (need Storage Blob Data Delegator OR Data Owner on the storage account). "
+            f"Underlying error: {e}"
+        ) from e
+    # For write scenarios we may request additional permissions later; default read/list
+    perms = ContainerSasPermissions(read=True, list=True)
+    sas = generate_container_sas(
+        account_name=str(service.account_name),
+        container_name=container,
+        user_delegation_key=udk,
+        permission=perms,
+        expiry=expiry,
+    )
+    return sas
+
+
 # --- Main execution logic ---
-
-
 def main(args):
     print("Loading job metadata...")
     try:
@@ -407,59 +293,242 @@ def main(args):
         print(f"Loaded {len(all_jobs_metadata)} job metadata records.")
     except Exception as e:
         print(f"Error loading or parsing {args.input}: {e}")
-        # Optional: Log exception details if logging is configured
         exit(1)
 
     # --- Build indexes for nested pipeline aware replay ---
     jobs_by_name, children_map, pipeline_names = _index_jobs(all_jobs_metadata)
     depths = _compute_depths(jobs_by_name)
 
-    # Define replay "units": each pipeline job (even if nested) + each standalone root command job
-    standalone_root_names = [
+    # --- Infer missing parent relationships (some extracts have parent_job_name=null) ---
+    inferred_links = 0
+    for jm in all_jobs_metadata:
+        try:
+            if jm.parent_job_name:  # already set
+                continue
+            props = jm.job_properties or {}
+            # Prefer explicit pipelinerun id, fall back to 'azureml.pipeline'
+            candidate_parent = props.get("azureml.pipelinerunid") or props.get(
+                "azureml.pipeline"
+            )
+            if (
+                candidate_parent
+                and candidate_parent in jobs_by_name
+                and candidate_parent in pipeline_names
+                and candidate_parent != jm.name
+            ):
+                # Set inferred parent
+                jm.parent_job_name = candidate_parent  # type: ignore[attr-defined]
+                inferred_links += 1
+        except Exception:
+            # Non-fatal; continue trying others
+            continue
+    if inferred_links:
+        print(
+            f"Inferred {inferred_links} pipeline child relationship(s) from provenance fields (azureml.pipelinerunid / azureml.pipeline)."
+        )
+        # Rebuild indexes & depths with updated parent assignments
+        jobs_by_name, children_map, pipeline_names = _index_jobs(all_jobs_metadata)
+        depths = _compute_depths(jobs_by_name)
+
+    manifests_by_job: Dict[str, str] = {}
+    source_account_name = None
+    target_account_name = None
+    source_container_name = None
+    target_container_name = None
+    source_sas = None
+    target_sas = None
+    if args.copy_artifacts and args.source:
+        try:
+            source_client = get_ml_client(args.source)
+            source_datastore = source_client.datastores.get("workspaceblobstore")
+            target_client_for_manifest = get_ml_client(args.target)
+            target_datastore = target_client_for_manifest.datastores.get(
+                "workspaceblobstore"
+            )
+            credential = AzureCliCredential()
+            source_account_name = getattr(source_datastore, "account_name", None)
+            target_account_name = getattr(target_datastore, "account_name", None)
+            source_container_name = "azureml"
+            target_container_name = "azureml"
+            src_blob_service = BlobServiceClient(
+                f"https://{source_account_name}.blob.core.windows.net",
+                credential=credential,
+            )
+            tgt_blob_service = BlobServiceClient(
+                f"https://{target_account_name}.blob.core.windows.net",
+                credential=credential,
+            )
+            # Build SAS: source read, target write
+            source_sas = build_container_sas(
+                src_blob_service, source_container_name, hours=6
+            )
+            # Write-enabled target SAS
+            start = datetime.now(timezone.utc) - timedelta(minutes=5)
+            expiry = datetime.now(timezone.utc) + timedelta(hours=6)
+            try:
+                udk_tgt = tgt_blob_service.get_user_delegation_key(start, expiry)
+                perms_tgt = ContainerSasPermissions(
+                    read=True, list=True, create=True, write=True, add=True
+                )
+                target_sas = generate_container_sas(
+                    account_name=str(tgt_blob_service.account_name),
+                    container_name=target_container_name,
+                    user_delegation_key=udk_tgt,
+                    permission=perms_tgt,
+                    expiry=expiry,
+                )
+            except Exception as e:  # noqa: BLE001
+                print(f"WARNING: Failed generating write-enabled SAS for target: {e}")
+                target_sas = None
+            print("Prepared storage context for in-run server-side artifact copy.")
+        except Exception as e:  # noqa: BLE001
+            print(f"WARNING: Could not prepare storage context for manifests: {e}")
+            source_account_name = None
+
+    for jm in jobs_raw:  # jobs_raw contains dicts
+        meta = JobMetadata(**jm)
+        rel_paths = getattr(meta, "mlflow_artifact_paths", None) or []
+        if not (args.copy_artifacts and source_account_name and rel_paths):
+            fd, manifest_path = tempfile.mkstemp(
+                suffix=f"_{meta.name}_manifest_disabled.json"
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as mf:
+                json.dump(
+                    {
+                        "schema_version": 1,
+                        "disabled": True,
+                        "original_run_id": meta.name,
+                        "relative_paths": [],
+                    },
+                    mf,
+                )
+            manifests_by_job[meta.name] = manifest_path
+            continue
+        # Select only relevant folders: outputs and log families (logs, system_logs, user_logs)
+        outputs_only = [p for p in rel_paths if p.startswith("outputs/")]
+        log_paths = [
+            p
+            for p in rel_paths
+            if p.startswith("logs/")
+            or p.startswith("system_logs/")
+            or p.startswith("user_logs/")
+        ]
+        combined = outputs_only + [p for p in log_paths if p not in outputs_only]
+        selected_paths = combined if combined else rel_paths
+        # Provide normalized mapping guidance (not consumed yet but helpful for debugging / future logic)
+        normalized_selected_paths = []
+        for p in selected_paths:
+            if p.startswith("outputs/"):
+                normalized_selected_paths.append(p[len("outputs/") :])
+            elif (
+                p.startswith("logs/")
+                or p.startswith("system_logs/")
+                or p.startswith("user_logs/")
+            ):
+                normalized_selected_paths.append(f"original_logs/{p}")
+            else:
+                normalized_selected_paths.append(p)
+        fd, manifest_path = tempfile.mkstemp(
+            suffix=f"_{meta.name}_artifact_manifest.json"
+        )
+        manifest = {
+            "schema_version": 1,
+            "disabled": False,
+            "original_run_id": meta.name,
+            "source": {
+                "account": source_account_name,
+                "container": source_container_name,
+                "prefix": f"ExperimentRun/dcid.{meta.name}",
+                "sas": source_sas,
+            },
+            "target": {
+                "account": target_account_name,
+                "container": target_container_name,
+                "sas": target_sas,
+            },
+            "relative_paths": selected_paths,
+            "normalized_relative_paths": normalized_selected_paths,
+            "total_rel_paths": len(rel_paths),
+            "filtered_outputs": len(outputs_only),
+            "filtered_logs": len(log_paths),
+        }
+        with os.fdopen(fd, "w", encoding="utf-8") as mf:
+            json.dump(manifest, mf)
+        manifests_by_job[meta.name] = manifest_path
+    if manifests_by_job:
+        print(f"Prepared {len(manifests_by_job)} artifact manifest file(s).")
+
+    # --- Hierarchical classification ---
+    # Build set of pipeline nodes (job_type==pipeline) and map their direct children.
+    pipeline_children: Dict[str, List[str]] = {name: [] for name in pipeline_names}
+    leaf_command_jobs: Set[str] = set()
+    for jm in all_jobs_metadata:
+        if jm.parent_job_name and jm.parent_job_name in pipeline_children:
+            # classify as child of a pipeline
+            pipeline_children[jm.parent_job_name].append(jm.name)
+        jt = (jm.job_type or "").lower()
+        if jt != "pipeline":
+            leaf_command_jobs.add(jm.name)
+
+    # Determine root pipelines (no parent pipeline) and nested pipelines (have parent pipeline)
+    parent_pipeline_of: Dict[str, Optional[str]] = {}
+    for p in pipeline_names:
+        parent_name = jobs_by_name[p].parent_job_name
+        if parent_name and parent_name in pipeline_names:
+            parent_pipeline_of[p] = parent_name
+        else:
+            parent_pipeline_of[p] = None
+    root_pipelines = [p for p, par in parent_pipeline_of.items() if par is None]
+    # nested_pipelines list not needed directly; retained via parent_pipeline_of
+
+    # Attach depth information for pipelines
+    pipeline_depths: Dict[str, int] = {}
+    def compute_pipeline_depth(p: str) -> int:
+        if p in pipeline_depths:
+            return pipeline_depths[p]
+        parent = parent_pipeline_of.get(p)
+        if not parent:
+            pipeline_depths[p] = 0
+            return 0
+        d = 1 + compute_pipeline_depth(parent)
+        pipeline_depths[p] = d
+        return d
+    for p in pipeline_names:
+        compute_pipeline_depth(p)
+
+    # Build replay units: process pipelines in increasing depth, then standalone command roots (those without parent and not pipelines)
+    pipeline_order = sorted(pipeline_names, key=lambda n: (pipeline_depths.get(n, 0), n))
+    standalone_root_commands = [
         jm.name
         for jm in all_jobs_metadata
-        if jm.name not in pipeline_names and not jm.parent_job_name
+        if (jm.name not in pipeline_names) and not jm.parent_job_name
     ]
-
-    # Promote standalone AutoML jobs to pipeline units if we want to expand trials
-    if args.expand_automl_trials:
-        promoted = []
-        for name in standalone_root_names[:]:
-            meta = jobs_by_name[name]
-            jt = (meta.job_type or "").lower()
-            if (
-                jt == "automl"
-                or (meta.job_properties or {}).get("runTemplate") == "AutoML"
-            ):
-                pipeline_names.add(name)
-                standalone_root_names.remove(name)
-                promoted.append(name)
-        if promoted:
-            print(
-                f"Promoted {len(promoted)} standalone AutoML root job(s) to pipeline units for trial expansion: {promoted}"
-            )
-    # Order units by depth then name for deterministic processing (roots first)
-    pipeline_unit_names = sorted(pipeline_names, key=lambda n: (depths.get(n, 0), n))
-    standalone_root_names = sorted(
-        standalone_root_names, key=lambda n: (depths.get(n, 0), n)
-    )
-    replay_units: List[Tuple[str, str]] = [
-        ("pipeline", n) for n in pipeline_unit_names
-    ] + [("standalone", n) for n in standalone_root_names]
-
+    standalone_root_commands = sorted(standalone_root_commands)
+    replay_units: List[Tuple[str, str]] = [("pipeline", n) for n in pipeline_order] + [
+        ("standalone", n) for n in standalone_root_commands
+    ]
     print(
-        f"Prepared {len(replay_units)} replay units: {len(pipeline_unit_names)} pipeline(s) + {len(standalone_root_names)} standalone root job(s)."
+        f"Prepared {len(replay_units)} replay units (pipelines={len(pipeline_names)}, standalone_roots={len(standalone_root_commands)})."
     )
+    if args.debug_hierarchy:
+        print("\nHierarchy Debug Tree (pipelines only):")
+        def print_tree(node: str, indent: str = ""):
+            print(f"{indent}- {node} (depth={pipeline_depths[node]})")
+            for ch in sorted(pipeline_children.get(node, [])):
+                if ch in pipeline_names:
+                    print_tree(ch, indent + "  ")
+        for rp in sorted(root_pipelines):
+            print_tree(rp)
+        print("End Hierarchy Debug Tree\n")
 
     # --- Connect to Client and Register Environment ---
-    registered_env_id_for_jobs = None
     try:
         client = get_ml_client(args.target)
         print(f"Connected to target workspace: {client.workspace_name}")
 
         # Register the environment only if not doing a dry run
         if not args.dry_run:
-            from replayer.dummy_components import DUMMY_ENV, REGISTERED_ENV_ID
+            from replayer.dummy_components import DUMMY_ENV
 
             print(
                 f"Ensuring dummy environment '{DUMMY_ENV.name}:{DUMMY_ENV.version}' exists..."
@@ -467,20 +536,12 @@ def main(args):
             try:
                 env_reg = client.environments.create_or_update(DUMMY_ENV)
                 print(f" -> Environment '{env_reg.name}:{env_reg.version}' is ready.")
-                registered_env_id_for_jobs = REGISTERED_ENV_ID
             except Exception as e:
                 print(f"❌ Error registering/updating dummy environment: {e}")
                 print("Cannot proceed without the registered environment. Exiting.")
                 exit(1)
-        else:
-            from replayer.dummy_components import REGISTERED_ENV_ID
-
-            registered_env_id_for_jobs = REGISTERED_ENV_ID
-            print("Dry run: Skipping environment registration.")
-
     except Exception as e:
         print(f"Error connecting to target workspace: {e}")
-        # Optional: Log exception details if logging is configured
         exit(1)
 
     # --- Process and Submit/Dry-Run Jobs ---
@@ -490,13 +551,9 @@ def main(args):
     processed_count = 0
     job_map = {}  # original_id -> new_job_name / description
 
-    # Ensure environment ID was set (should be unless dry run skipped it, which is ok for dry run)
-    if not registered_env_id_for_jobs and not args.dry_run:
-        print("Error: Environment ID was not set after registration attempt. Exiting.")
-        exit(1)
-
     total_units = len(replay_units)
 
+    # We also optionally prepare for artifact copy: we only need mapping original->replay job names.
     for unit_type, job_name in replay_units:
         if args.limit is not None and processed_count >= args.limit:
             print(f"\nReached processing limit ({args.limit}). Stopping.")
@@ -528,36 +585,28 @@ def main(args):
                 job_to_submit = build_dummy_standalone_job(
                     original_job_metadata,
                     temp_metrics_filepath_standalone,
-                    artifacts_dir=args.artifacts_dir,
-                    upload_artifacts=not args.no_artifacts,
+                    artifact_manifest_path=manifests_by_job.get(
+                        original_job_metadata.name
+                    ),
                 )
             elif unit_type == "pipeline":
                 parent_meta = jm
-                children_meta = children_map.get(parent_meta.name, [])
-                if children_meta:
-                    print(
-                        f" -> Pipeline job with {len(children_meta)} direct child job(s)."
-                    )
+                direct_children = [jobs_by_name[n] for n in pipeline_children.get(parent_meta.name, [])]
+                leaf_children = [c for c in direct_children if (c.job_type or "").lower() != "pipeline"]
+                print(
+                    f" -> Pipeline job depth={pipeline_depths.get(parent_meta.name, 0)} with {len(leaf_children)} direct leaf step(s) and {sum(1 for c in direct_children if (c.job_type or '').lower()=='pipeline')} nested pipeline child(ren)."
+                )
+                if leaf_children:
                     temp_pipeline_dir_path = tempfile.mkdtemp()
                     job_to_submit = build_dummy_pipeline_for_children(
                         parent_meta,
-                        children_meta,
+                        leaf_children,
                         temp_pipeline_dir_path,
                         children_map=children_map,
-                        jobs_by_name=jobs_by_name,
-                        expand_automl_trials=args.expand_automl_trials,
-                        replay_automl_max_trials=args.replay_automl_max_trials,
-                        replay_automl_top_metric=args.replay_automl_top_metric,
-                        replay_automl_trial_sampling=args.replay_automl_trial_sampling,
-                        artifacts_dir=args.artifacts_dir,
-                        upload_artifacts=not args.no_artifacts,
-                        include_trial_artifacts=args.include_trial_artifacts,
+                        manifest_paths=manifests_by_job,
                     )
-                    if job_to_submit is None:
-                        print(
-                            " -> No steps generated (possibly no metrics). Falling back to standalone replay for pipeline parent."
-                        )
-                if not children_meta or job_to_submit is None:
+                if job_to_submit is None:
+                    # Fallback to standalone representation (no leaf steps)
                     metrics_to_log = parent_meta.mlflow_metrics or {}
                     metrics_json_str = json.dumps(metrics_to_log)
                     with tempfile.NamedTemporaryFile(
@@ -568,9 +617,23 @@ def main(args):
                     job_to_submit = build_dummy_standalone_job(
                         parent_meta,
                         temp_metrics_filepath_standalone,
-                        artifacts_dir=args.artifacts_dir,
-                        upload_artifacts=not args.no_artifacts,
+                        artifact_manifest_path=manifests_by_job.get(parent_meta.name),
                     )
+                # Add hierarchy tags
+                if job_to_submit is not None:
+                    # Ensure tags dict exists
+                    if getattr(job_to_submit, 'tags', None) is None:
+                        try:
+                            job_to_submit.tags = {}
+                        except Exception:
+                            pass
+                    tags_dict = getattr(job_to_submit, 'tags', None)
+                    if tags_dict is not None and isinstance(tags_dict, dict):
+                        depth_val = pipeline_depths.get(parent_meta.name, 0)
+                        tags_dict[PIPELINE_DEPTH_TAG] = str(depth_val)
+                        parent_pipeline = parent_pipeline_of.get(parent_meta.name)
+                        if parent_pipeline:
+                            tags_dict[ORIGINAL_PARENT_PIPELINE_ID_TAG] = parent_pipeline
             else:
                 print(f" -> Unknown unit type '{unit_type}'. Skipping.")
                 skipped_count += 1
@@ -692,6 +755,8 @@ def main(args):
         print(" (No jobs submitted or processed)")
     print("----------------------")
 
+    print("Done.")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -701,56 +766,35 @@ if __name__ == "__main__":
     parser.add_argument("--input", required=True, help="Path to extracted jobs.json")
     parser.add_argument(
         "--dry-run",
-        action="store_true",  # Makes it a flag, True if present
+        action="store_true",
         help="Perform parsing and build job objects, but do not submit to Azure ML.",
     )
     parser.add_argument(
         "--limit",
         type=int,
-        default=None,  # Default is no limit
+        default=None,
         help="Limit the number of original execution units (pipelines/standalone jobs) to process for testing.",
     )
+    # AutoML expansion disabled; flags removed for clarity
     parser.add_argument(
-        "--expand-automl-trials",
+        "--debug-hierarchy",
         action="store_true",
-        help="Expand AutoML parent steps into individual trial steps in replay pipelines.",
+        help="Print a debug tree of the reconstructed pipeline hierarchy before submission.",
+        default=False,
     )
     parser.add_argument(
-        "--replay-automl-max-trials",
-        type=int,
-        default=None,
-        help="Cap number of AutoML trials per expanded AutoML parent during replay.",
-    )
-    parser.add_argument(
-        "--replay-automl-top-metric",
+        "--source",
         type=str,
         default=None,
-        help="Primary metric name for ordering AutoML trials when sampling (replay). If omitted, inferred from first numeric metric.",
+        help="Path to source workspace config JSON (required for --copy-artifacts to resolve original artifact locations).",
     )
     parser.add_argument(
-        "--replay-automl-trial-sampling",
-        type=str,
-        choices=["best", "first", "random"],
-        default="best",
-        help="Sampling strategy when selecting AutoML trials for replay expansion.",
-    )
-    parser.add_argument(
-        "--no-artifacts",
+        "--copy-artifacts",
         action="store_true",
-        help="Do not upload/log artifacts for runs (artifacts are uploaded by default).",
+        help="After replay submission, perform server-side copy of original artifacts into a dedicated migration prefix (no filtering).",
+        default=True,
     )
-    parser.add_argument(
-        "--artifacts-dir",
-        type=str,
-        default="artifacts_export",
-        help="Directory root containing per-run artifact folders from extraction phase.",
-    )
-    parser.add_argument(
-        "--include-trial-artifacts",
-        action="store_true",
-        help="Upload artifacts for AutoML trial runs when trials are expanded (default: only parent/non-trial).",
-    )
-    # Removed deprecated --keep-automl-parent-step: parent always retained when expanding trials.
+
     args = parser.parse_args()
 
     main(args)
