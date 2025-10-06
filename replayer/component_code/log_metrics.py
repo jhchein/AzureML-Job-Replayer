@@ -6,7 +6,7 @@ import shutil
 import time
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
-from azure.storage.blob import BlobClient
+from azure.storage.blob import BlobClient, ContainerClient
 
 
 def log_metrics(
@@ -68,32 +68,77 @@ def log_metrics(
                 )
             else:
                 src_list: List[str] = manifest.get("relative_paths", [])
-                norm_list_raw = manifest.get("normalized_relative_paths")
-                norm_list: Optional[List[str]] = (
-                    list(norm_list_raw) if isinstance(norm_list_raw, list) else None
+
+                # src_list now contains folder prefixes like ["outputs/", "system_logs/", etc.]
+                # We need to list all blobs under each prefix, then download them
+                print(
+                    f"Manifest contains {len(src_list)} folder prefix(es) to enumerate and download."
                 )
-                use_pairing = bool(norm_list and len(norm_list) == len(src_list))
-                work_items: List[Tuple[str, Optional[str]]]
-                if use_pairing:
-                    assert norm_list is not None
-                    work_items = list(zip(src_list, norm_list))
-                else:
-                    if norm_list:
-                        print(
-                            "Normalized list length mismatch; falling back to dynamic normalization."
-                        )
-                    work_items = [(p, None) for p in src_list]
+
+                # Build container client to list blobs
+                container_url = f"https://{src_acct}.blob.core.windows.net/{src_container}?{src_sas}"
+                print(f"Container URL (with SAS): {container_url[:80]}...?<SAS_TOKEN>")
+                container_client = ContainerClient.from_container_url(container_url)
+
+                print(f"Source blob prefix for job: {src_prefix}")
+
+                # Enumerate all blobs under each folder prefix
+                work_items: List[Tuple[str, str]] = []
+                for folder_prefix in src_list:
+                    folder_clean = folder_prefix.lstrip("/\\").rstrip(
+                        "/\\"
+                    )  # Remove trailing slashes too
+                    full_prefix = f"{src_prefix}/{folder_clean}".strip("/")
+                    print(f"Listing blobs under prefix: '{full_prefix}' ...")
+                    print(f"  Folder prefix from manifest: '{folder_prefix}'")
+                    print(f"  Cleaned folder: '{folder_clean}'")
+                    print(f"  Full blob prefix: '{full_prefix}'")
+
+                    try:
+                        blob_count = 0
+                        for blob in container_client.list_blobs(
+                            name_starts_with=full_prefix
+                        ):
+                            # blob.name is the full path within the container
+                            # Extract the relative path from src_prefix onwards
+                            if blob.name.startswith(f"{src_prefix}/"):
+                                rel_path = blob.name[len(src_prefix) + 1 :]
+                            else:
+                                rel_path = blob.name
+
+                            # Debug: print first few blobs
+                            if blob_count < 3:
+                                print(
+                                    f"    DEBUG: blob.name='{blob.name}' -> rel_path='{rel_path}'"
+                                )
+
+                            # Compute normalized destination path
+                            if rel_path.startswith("outputs/"):
+                                # Strip outputs/ prefix for destination
+                                norm_dest = rel_path[len("outputs/") :]
+                            elif (
+                                rel_path.startswith("logs/")
+                                or rel_path.startswith("system_logs/")
+                                or rel_path.startswith("user_logs/")
+                            ):
+                                # Map logs to outputs/original_logs/
+                                norm_dest = f"outputs/original_logs/{rel_path}"
+                            else:
+                                norm_dest = rel_path
+
+                            work_items.append((rel_path, norm_dest))
+                            blob_count += 1
+
+                        print(f"  ✓ Found {blob_count} blob(s) under '{folder_clean}'")
+                    except Exception as e:  # noqa: BLE001
+                        print(f"  ERROR listing blobs for prefix {full_prefix}: {e}")
 
                 if not work_items:
-                    print("No artifacts listed in manifest to download.")
+                    print("No blob files found under the specified folder prefixes.")
                 else:
-                    print(
-                        f"Planned downloads: {len(work_items)} (pairing={use_pairing})"
-                    )
-                    for s_rel, maybe_norm in work_items[:3]:
-                        print(
-                            f"  SAMPLE SRC='{s_rel}' -> DST='{maybe_norm or '<normalize>'}'"
-                        )
+                    print(f"Planned downloads: {len(work_items)} blob file(s)")
+                    for s_rel, norm_dest in work_items[:3]:
+                        print(f"  SAMPLE SRC='{s_rel}' -> DST='{norm_dest}'")
 
                 base_outputs = Path("outputs")
                 base_outputs.mkdir(exist_ok=True)
@@ -101,25 +146,22 @@ def log_metrics(
                 success = 0
                 failures: List[Dict[str, Any]] = []
                 total_bytes = 0
-                for src_rel, maybe_norm in work_items:
+                for src_rel, norm_dest in work_items:
                     rel_clean = src_rel.lstrip("/\\")
-                    # destination path logic
-                    if use_pairing and maybe_norm:
-                        dest_rel = maybe_norm.lstrip("/\\")
-                    else:
-                        if rel_clean.startswith("outputs/"):
-                            dest_rel = rel_clean[len("outputs/") :]
-                        elif (
-                            rel_clean.startswith("logs/")
-                            or rel_clean.startswith("system_logs/")
-                            or rel_clean.startswith("user_logs/")
-                        ):
-                            dest_rel = f"original_logs/{rel_clean}"
-                        else:
-                            dest_rel = rel_clean
+                    dest_rel = norm_dest.lstrip("/\\")
+
                     # Basic path sanitization
                     dest_rel = dest_rel.replace("..", "__")
-                    local_path = base_outputs / dest_rel
+
+                    # Determine final local path:
+                    # - Files from outputs/ (dest without outputs/ prefix) go to outputs/ root
+                    # - Files from logs (dest with outputs/original_logs/ prefix) go there
+                    if dest_rel.startswith("outputs/"):
+                        # Already has outputs/ prefix (logs remapped to outputs/original_logs/)
+                        local_path = Path(dest_rel)
+                    else:
+                        # Stripped outputs/ prefix - write to outputs/ directory
+                        local_path = base_outputs / dest_rel
                     local_path.parent.mkdir(parents=True, exist_ok=True)
 
                     # Build source blob URL
@@ -181,7 +223,6 @@ def log_metrics(
                                 "failures": failures[:25],
                                 "bytes": total_bytes,
                                 "elapsed_sec": elapsed,
-                                "pairing": use_pairing,
                             },
                             sf,
                             indent=2,

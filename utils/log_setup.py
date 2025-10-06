@@ -4,8 +4,8 @@ import sys
 from datetime import datetime
 
 LOG_DIR = "logs"
-LOG_LEVEL_FILE = logging.DEBUG  # Keep DEBUG for detailed file logs (incl. Azure SDK)
-LOG_LEVEL_CONSOLE = logging.WARNING  # <<< CHANGE HERE: Set console to WARNING
+LOG_LEVEL_FILE = logging.INFO  # Change to DEBUG for development, INFO for production
+LOG_LEVEL_CONSOLE = logging.WARNING  # Console shows only warnings and errors
 
 # Define a flag to prevent multiple setups
 _logging_configured = False
@@ -57,11 +57,29 @@ def setup_logging(log_filename_prefix="app"):
     azure_logger.setLevel(LOG_LEVEL_FILE)
     azure_logger.propagate = True  # Let messages flow to root logger's handlers
 
+    # --- Reduce Azure HTTP logging verbosity ---
+    # This suppresses the verbose HTTP request/response logs (biggest noise source)
+    azure_http_logger = logging.getLogger(
+        "azure.core.pipeline.policies.http_logging_policy"
+    )
+    azure_http_logger.setLevel(logging.WARNING)
+
+    # --- Reduce Azure Identity logging verbosity ---
+    # Suppresses repetitive "get_token succeeded" messages
+    azure_identity_logger = logging.getLogger("azure.identity")
+    azure_identity_logger.setLevel(logging.WARNING)
+
     # --- Configure MLflow Logger ---
     mlflow_logger = logging.getLogger("mlflow")
-    # Keep MLflow relatively quiet unless needed
-    mlflow_logger.setLevel(logging.INFO)
+    # Keep MLflow quiet - only show warnings and errors
+    mlflow_logger.setLevel(logging.WARNING)
     mlflow_logger.propagate = True
+
+    # --- Suppress noisy third-party library DEBUG logs ---
+    logging.getLogger("urllib3").setLevel(logging.INFO)
+    logging.getLogger("attr_dict").setLevel(logging.INFO)
+    logging.getLogger("azure.core.pipeline.policies").setLevel(logging.WARNING)
+    logging.getLogger("azureml").setLevel(logging.INFO)
 
     # --- Final message (using print to stdout) ---
     print(

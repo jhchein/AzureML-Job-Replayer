@@ -404,28 +404,25 @@ def main(args):
                 )
             manifests_by_job[meta.name] = manifest_path
             continue
-        # Select only relevant folders: outputs and log families (logs, system_logs, user_logs)
-        outputs_only = [p for p in rel_paths if p.startswith("outputs/")]
-        log_paths = [
-            p
-            for p in rel_paths
-            if p.startswith("logs/")
-            or p.startswith("system_logs/")
-            or p.startswith("user_logs/")
-        ]
-        combined = outputs_only + [p for p in log_paths if p not in outputs_only]
-        selected_paths = combined if combined else rel_paths
-        # Provide normalized mapping guidance (not consumed yet but helpful for debugging / future logic)
+
+        # rel_paths now contains the static list of default folders: ["outputs/", "system_logs/", "logs/", "user_logs/"]
+        # These represent folder prefixes to copy recursively (all files and subdirectories under each)
+        selected_paths = rel_paths  # Use the static folder list directly
+
+        # Map target paths: outputs/ stays as-is (root of artifacts), logs go to outputs/original_logs/
         normalized_selected_paths = []
         for p in selected_paths:
             if p.startswith("outputs/"):
-                normalized_selected_paths.append(p[len("outputs/") :])
+                # outputs/ content goes to root of target artifacts (strip the outputs/ prefix)
+                # But we copy the entire outputs/ folder, so keep it as-is for blob copy
+                normalized_selected_paths.append(p)
             elif (
                 p.startswith("logs/")
                 or p.startswith("system_logs/")
                 or p.startswith("user_logs/")
             ):
-                normalized_selected_paths.append(f"original_logs/{p}")
+                # All logs go under outputs/original_logs/ in target
+                normalized_selected_paths.append(f"outputs/original_logs/{p}")
             else:
                 normalized_selected_paths.append(p)
         fd, manifest_path = tempfile.mkstemp(
@@ -448,9 +445,7 @@ def main(args):
             },
             "relative_paths": selected_paths,
             "normalized_relative_paths": normalized_selected_paths,
-            "total_rel_paths": len(rel_paths),
-            "filtered_outputs": len(outputs_only),
-            "filtered_logs": len(log_paths),
+            "comment": "Static folder list: all contents under each folder copied recursively. Logs remapped to outputs/original_logs/",
         }
         with os.fdopen(fd, "w", encoding="utf-8") as mf:
             json.dump(manifest, mf)
@@ -483,6 +478,7 @@ def main(args):
 
     # Attach depth information for pipelines
     pipeline_depths: Dict[str, int] = {}
+
     def compute_pipeline_depth(p: str) -> int:
         if p in pipeline_depths:
             return pipeline_depths[p]
@@ -493,11 +489,14 @@ def main(args):
         d = 1 + compute_pipeline_depth(parent)
         pipeline_depths[p] = d
         return d
+
     for p in pipeline_names:
         compute_pipeline_depth(p)
 
     # Build replay units: process pipelines in increasing depth, then standalone command roots (those without parent and not pipelines)
-    pipeline_order = sorted(pipeline_names, key=lambda n: (pipeline_depths.get(n, 0), n))
+    pipeline_order = sorted(
+        pipeline_names, key=lambda n: (pipeline_depths.get(n, 0), n)
+    )
     standalone_root_commands = [
         jm.name
         for jm in all_jobs_metadata
@@ -512,11 +511,13 @@ def main(args):
     )
     if args.debug_hierarchy:
         print("\nHierarchy Debug Tree (pipelines only):")
+
         def print_tree(node: str, indent: str = ""):
             print(f"{indent}- {node} (depth={pipeline_depths[node]})")
             for ch in sorted(pipeline_children.get(node, [])):
                 if ch in pipeline_names:
                     print_tree(ch, indent + "  ")
+
         for rp in sorted(root_pipelines):
             print_tree(rp)
         print("End Hierarchy Debug Tree\n")
@@ -591,8 +592,14 @@ def main(args):
                 )
             elif unit_type == "pipeline":
                 parent_meta = jm
-                direct_children = [jobs_by_name[n] for n in pipeline_children.get(parent_meta.name, [])]
-                leaf_children = [c for c in direct_children if (c.job_type or "").lower() != "pipeline"]
+                direct_children = [
+                    jobs_by_name[n] for n in pipeline_children.get(parent_meta.name, [])
+                ]
+                leaf_children = [
+                    c
+                    for c in direct_children
+                    if (c.job_type or "").lower() != "pipeline"
+                ]
                 print(
                     f" -> Pipeline job depth={pipeline_depths.get(parent_meta.name, 0)} with {len(leaf_children)} direct leaf step(s) and {sum(1 for c in direct_children if (c.job_type or '').lower()=='pipeline')} nested pipeline child(ren)."
                 )
@@ -622,12 +629,12 @@ def main(args):
                 # Add hierarchy tags
                 if job_to_submit is not None:
                     # Ensure tags dict exists
-                    if getattr(job_to_submit, 'tags', None) is None:
+                    if getattr(job_to_submit, "tags", None) is None:
                         try:
                             job_to_submit.tags = {}
                         except Exception:
                             pass
-                    tags_dict = getattr(job_to_submit, 'tags', None)
+                    tags_dict = getattr(job_to_submit, "tags", None)
                     if tags_dict is not None and isinstance(tags_dict, dict):
                         depth_val = pipeline_depths.get(parent_meta.name, 0)
                         tags_dict[PIPELINE_DEPTH_TAG] = str(depth_val)

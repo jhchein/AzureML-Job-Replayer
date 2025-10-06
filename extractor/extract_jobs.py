@@ -19,44 +19,14 @@ from azure.core.exceptions import ResourceNotFoundError
 from dateutil import parser as date_parser
 from mlflow.exceptions import MlflowException
 from mlflow.tracking import MlflowClient
+from tqdm import tqdm
 
 from utils.aml_clients import get_ml_client
+from utils.log_setup import setup_logging
 
 # --- Logging Setup ---
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-logger.propagate = False
-
-azure_logger = logging.getLogger("azure")
-azure_logger.setLevel(logging.INFO)
-azure_logger.propagate = False
-
-
-def setup_logging():
-    log_dir = "logs"
-    os.makedirs(log_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_filename = os.path.join(log_dir, f"extract_jobs_{timestamp}.log")
-
-    file_handler = logging.FileHandler(log_filename, encoding="utf-8")
-    file_handler.setLevel(logging.INFO)
-    file_formatter = logging.Formatter(
-        "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
-    )
-    file_handler.setFormatter(file_formatter)
-
-    console_handler = logging.StreamHandler(sys.stderr)
-    console_handler.setLevel(logging.WARNING)
-    console_formatter = logging.Formatter("%(levelname)s: %(name)s: %(message)s")
-    console_handler.setFormatter(console_formatter)
-
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
-    azure_logger.addHandler(file_handler)
-    azure_logger.addHandler(console_handler)
-
-    print(f"Detailed logs will be written to: {log_filename}")
 
 
 def safe_isoformat(dt_obj: Any) -> Optional[str]:
@@ -181,26 +151,20 @@ def convert_complex_dict(obj: Any) -> Any:
         return f"<Unserializable object: {type(obj).__name__}>"
 
 
-def _list_artifact_file_paths(mlflow_client: MlflowClient, run_id: str) -> List[str]:
-    """Return a flat list of file artifact paths for a run without downloading artifacts."""
-    paths: List[str] = []
+def _get_default_artifact_folders() -> List[str]:
+    """Return the standard MLflow artifact folder names without making REST calls.
 
-    def list_dir(prefix: str):
-        try:
-            infos = mlflow_client.list_artifacts(run_id, prefix)
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                f"Artifact listing failed for run {run_id} prefix '{prefix}': {e}"
-            )
-            return
-        for info in infos:
-            if getattr(info, "is_dir", False):
-                list_dir(info.path)
-            else:
-                paths.append(info.path)
+    These are the default top-level directories created by AzureML jobs.
+    Using this static list eliminates the need for recursive artifact listing,
+    which can cause thousands of REST calls for deeply nested artifact trees.
 
-    list_dir("")
-    return paths
+    Returns folder prefixes that will be used for recursive blob copy operations:
+    - "outputs/": All job outputs (files and subdirectories copied recursively)
+    - "system_logs/": System-generated logs (copied recursively to outputs/original_logs/)
+    - "logs/": General logs (copied recursively to outputs/original_logs/)
+    - "user_logs/": User-generated logs (copied recursively to outputs/original_logs/)
+    """
+    return ["outputs/", "system_logs/", "logs/", "user_logs/"]
 
 
 @dataclass
@@ -571,13 +535,11 @@ def _process_single_job(
         return None, []
 
     if collect_artifacts and meta.mlflow_run_id:
-        try:
-            paths = _list_artifact_file_paths(mlflow_client, meta.mlflow_run_id)
-            meta.mlflow_artifact_paths = paths if paths else []
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                f"Artifact path listing failed for run {meta.mlflow_run_id}: {e}"
-            )
+        # Use static list of default artifact folders instead of recursive REST calls
+        meta.mlflow_artifact_paths = _get_default_artifact_folders()
+        logger.debug(
+            f"Assigned default artifact folders for run {meta.mlflow_run_id}: {meta.mlflow_artifact_paths}"
+        )
 
     # Children
     try:
@@ -632,7 +594,7 @@ def main(
     parallel: int = 1,
     include_artifacts: bool = True,
 ):
-    setup_logging()
+    setup_logging(log_filename_prefix="extract_jobs")
     try:
         client = get_ml_client(source_config)
         print(f"Connected to workspace: {client.workspace_name}")
@@ -688,6 +650,14 @@ def main(
 
     if parallel <= 1:
         queue = deque(root_names)
+        # Progress bar for sequential processing
+        pbar = tqdm(
+            total=len(root_names),
+            desc="Processing jobs",
+            unit="job",
+            dynamic_ncols=True,
+            file=sys.stdout,
+        )
         while queue:
             name = queue.popleft()
             if not name:
@@ -703,13 +673,29 @@ def main(
             if meta:
                 results.append(meta)
                 job_count += 1
+                pbar.set_postfix({"completed": job_count, "queued": len(queue)})
+            if children:
+                pbar.total += len(children)
+                pbar.refresh()
             for c in children:
                 queue.append(c)
+            pbar.update(1)
+        pbar.close()
     else:
         parallel = max(1, parallel)
         visited_lock = Lock()
         executor = ThreadPoolExecutor(max_workers=parallel)
         futures: Set[Future] = set()
+
+        # Progress bar for parallel processing with thread-safe updates
+        pbar = tqdm(
+            total=len(root_names),
+            desc="Processing jobs",
+            unit="job",
+            dynamic_ncols=True,
+            file=sys.stdout,
+        )
+        pbar_lock = Lock()
 
         def submit(name: str):
             futures.add(
@@ -735,12 +721,28 @@ def main(
                     meta, children = fut.result()
                 except Exception as e:  # noqa: BLE001
                     logger.error(f"Worker failed: {e}")
+                    with pbar_lock:
+                        pbar.update(1)
                     continue
                 if meta:
                     results.append(meta)
                     job_count += 1
-                for child in children:
-                    submit(child)
+                if children:
+                    with pbar_lock:
+                        pbar.total += len(children)
+                        pbar.refresh()
+                    for child in children:
+                        submit(child)
+                with pbar_lock:
+                    pbar.set_postfix(
+                        {
+                            "completed": job_count,
+                            "active": len(futures),
+                            "workers": parallel,
+                        }
+                    )
+                    pbar.update(1)
+        pbar.close()
         executor.shutdown(wait=True)
 
     elapsed = time.time() - start_time
@@ -828,7 +830,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--no-artifacts",
         action="store_true",
-        help="Skip artifact path manifest enumeration (faster).",
+        help="Skip including artifact folder paths in the output (default: include standard artifact folders).",
     )
 
     args = parser.parse_args()
