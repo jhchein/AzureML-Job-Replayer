@@ -19,6 +19,7 @@ from azure.core.exceptions import ResourceNotFoundError
 from dateutil import parser as date_parser
 from mlflow.exceptions import MlflowException
 from mlflow.tracking import MlflowClient
+from tqdm import tqdm
 
 from utils.aml_clients import get_ml_client
 from utils.log_setup import setup_logging
