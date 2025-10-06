@@ -30,7 +30,7 @@ from replayer.dummy_components import (
     REGISTERED_ENV_ID,
     replay_metrics_component,
 )
-from utils.aml_clients import get_ml_client
+from utils.aml_clients import get_ml_client, load_workspace_config
 from utils.log_setup import setup_logging
 
 setup_logging(
@@ -339,24 +339,34 @@ def main(args):
     target_sas = None
     if args.copy_artifacts and args.source:
         try:
+            # TODO: Add tenant_id support!
             source_client = get_ml_client(args.source)
             source_datastore = source_client.datastores.get("workspaceblobstore")
             target_client_for_manifest = get_ml_client(args.target)
             target_datastore = target_client_for_manifest.datastores.get(
                 "workspaceblobstore"
             )
-            credential = AzureCliCredential()
+
+            src_config = load_workspace_config(args.source)
+            target_config = load_workspace_config(args.target)
+
+            source_tenant_id = src_config["tenant_id"]
+            target_tenant_id = target_config["tenant_id"]
+
+            source_credential = AzureCliCredential(tenant_id=source_tenant_id)
+            target_credential = AzureCliCredential(tenant_id=target_tenant_id)
+
             source_account_name = getattr(source_datastore, "account_name", None)
             target_account_name = getattr(target_datastore, "account_name", None)
             source_container_name = "azureml"
             target_container_name = "azureml"
             src_blob_service = BlobServiceClient(
                 f"https://{source_account_name}.blob.core.windows.net",
-                credential=credential,
+                credential=source_credential,
             )
             tgt_blob_service = BlobServiceClient(
                 f"https://{target_account_name}.blob.core.windows.net",
-                credential=credential,
+                credential=target_credential,
             )
             # Build SAS: source read, target write
             source_sas = build_container_sas(
@@ -388,7 +398,9 @@ def main(args):
     for jm in jobs_raw:  # jobs_raw contains dicts
         meta = JobMetadata(**jm)
         rel_paths = getattr(meta, "mlflow_artifact_paths", None) or []
-        if not (args.copy_artifacts and source_account_name and rel_paths):
+        if not (
+            args.copy_artifacts and source_account_name and rel_paths
+        ):  # Todo: remove copy_artifacts
             fd, manifest_path = tempfile.mkstemp(
                 suffix=f"_{meta.name}_manifest_disabled.json"
             )

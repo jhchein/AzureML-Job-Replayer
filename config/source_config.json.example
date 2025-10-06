@@ -1,5 +1,6 @@
 {
   "subscription_id": "...",
   "resource_group": "...",
-  "workspace_name": "..."
+  "workspace_name": "...",
+  "tenant_id": "..."
 }

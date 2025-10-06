@@ -12,7 +12,8 @@ def load_workspace_config(config_path: str) -> dict:
     {
         "subscription_id": "<Azure subscription ID>",
         "resource_group": "<Resource group name>",
-        "workspace_name": "<Azure ML workspace name>"
+        "workspace_name": "<Azure ML workspace name>",
+        "tenant_id": "<Azure tenant ID (optional)>"
     }
     """
     path = Path(config_path)
@@ -29,7 +30,7 @@ def get_ml_client(config_path: str) -> MLClient:
     cfg = load_workspace_config(config_path)
 
     return MLClient(
-        credential=AzureCliCredential(),
+        credential=AzureCliCredential(tenant_id=cfg["tenant_id"]),
         subscription_id=cfg["subscription_id"],
         resource_group_name=cfg["resource_group"],
         workspace_name=cfg["workspace_name"],
