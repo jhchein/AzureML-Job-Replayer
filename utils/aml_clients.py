@@ -29,8 +29,14 @@ def get_ml_client(config_path: str) -> MLClient:
     """
     cfg = load_workspace_config(config_path)
 
+    tenant_id = cfg.get("tenant_id")
+    if not tenant_id:
+        raise ValueError(
+            f"Workspace config '{config_path}' is missing 'tenant_id'. Provide the tenant so cross-tenant auth can succeed."
+        )
+
     return MLClient(
-        credential=AzureCliCredential(tenant_id=cfg["tenant_id"]),
+        credential=AzureCliCredential(tenant_id=tenant_id),
         subscription_id=cfg["subscription_id"],
         resource_group_name=cfg["resource_group"],
         workspace_name=cfg["workspace_name"],

@@ -285,6 +285,12 @@ def build_container_sas(service: BlobServiceClient, container: str, hours: int =
 
 # --- Main execution logic ---
 def main(args):
+    if args.copy_artifacts and not args.source:
+        print(
+            "--copy-artifacts requires --source to be provided for artifact workspace resolution."
+        )
+        exit(1)
+
     print("Loading job metadata...")
     try:
         with open(args.input, "r", encoding="utf-8") as f:
@@ -358,8 +364,12 @@ def main(args):
 
             source_account_name = getattr(source_datastore, "account_name", None)
             target_account_name = getattr(target_datastore, "account_name", None)
-            source_container_name = "azureml"
-            target_container_name = "azureml"
+            source_container_name = getattr(source_datastore, "container_name", None)
+            target_container_name = getattr(target_datastore, "container_name", None)
+            if not source_container_name or not target_container_name:
+                raise RuntimeError(
+                    "Datastore container name missing for source or target workspace."
+                )
             src_blob_service = BlobServiceClient(
                 f"https://{source_account_name}.blob.core.windows.net",
                 credential=source_credential,
@@ -388,19 +398,19 @@ def main(args):
                     expiry=expiry,
                 )
             except Exception as e:  # noqa: BLE001
-                print(f"WARNING: Failed generating write-enabled SAS for target: {e}")
-                target_sas = None
+                raise RuntimeError(
+                    "Failed generating write-enabled SAS for target storage account. "
+                    "Ensure the signed-in identity has Storage Blob Data Contributor and Data Delegator roles."
+                ) from e
             print("Prepared storage context for in-run server-side artifact copy.")
         except Exception as e:  # noqa: BLE001
-            print(f"WARNING: Could not prepare storage context for manifests: {e}")
-            source_account_name = None
+            print(f"ERROR: Could not prepare storage context for manifests: {e}")
+            exit(1)
 
     for jm in jobs_raw:  # jobs_raw contains dicts
         meta = JobMetadata(**jm)
         rel_paths = getattr(meta, "mlflow_artifact_paths", None) or []
-        if not (
-            args.copy_artifacts and source_account_name and rel_paths
-        ):  # Todo: remove copy_artifacts
+        if not args.copy_artifacts:
             fd, manifest_path = tempfile.mkstemp(
                 suffix=f"_{meta.name}_manifest_disabled.json"
             )
@@ -416,6 +426,22 @@ def main(args):
                 )
             manifests_by_job[meta.name] = manifest_path
             continue
+
+        if not source_account_name:
+            print(
+                "ERROR: Artifact copy requested but storage context is unavailable. Ensure SAS generation succeeded earlier."
+            )
+            exit(1)
+        if not source_sas:
+            print(
+                "ERROR: Artifact copy requested but source SAS token was not generated. Verify storage permissions."
+            )
+            exit(1)
+        if not rel_paths:
+            print(
+                f"ERROR: Artifact copy requested but job {meta.name} has no artifact paths. Re-run extraction with artifact collection enabled."
+            )
+            exit(1)
 
         # rel_paths now contains the static list of default folders: ["outputs/", "system_logs/", "logs/", "user_logs/"]
         # These represent folder prefixes to copy recursively (all files and subdirectories under each)
