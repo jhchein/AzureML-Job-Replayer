@@ -55,6 +55,15 @@ def log_metrics(
         except Exception as e:  # noqa: BLE001
             print(f"Artifact manifest load failed: {e}")
             manifest = None
+        if perform_server_copy:
+            if manifest is None:
+                raise RuntimeError(
+                    "Artifact copy requested but manifest could not be loaded inside replay step."
+                )
+            if manifest.get("disabled"):
+                raise RuntimeError(
+                    "Artifact copy requested but manifest is disabled. Check replay logs for SAS generation errors."
+                )
         if manifest and not manifest.get("disabled") and perform_server_copy:
             print("Starting artifact download into local ./outputs ...")
             src_info = manifest.get("source", {})
@@ -63,8 +72,8 @@ def log_metrics(
             src_prefix = (src_info.get("prefix") or "").strip("/")
             src_sas = src_info.get("sas")
             if not (src_acct and src_container and src_sas):
-                print(
-                    "Manifest missing required source fields (account/container/sas); skipping downloads."
+                raise RuntimeError(
+                    "Artifact manifest missing account/container/sas values; cannot perform server-side copy."
                 )
             else:
                 src_list: List[str] = manifest.get("relative_paths", [])
@@ -131,7 +140,9 @@ def log_metrics(
 
                         print(f"  ✓ Found {blob_count} blob(s) under '{folder_clean}'")
                     except Exception as e:  # noqa: BLE001
-                        print(f"  ERROR listing blobs for prefix {full_prefix}: {e}")
+                        raise RuntimeError(
+                            f"Failed to enumerate blobs for prefix {full_prefix}: {e}"
+                        ) from e
 
                 if not work_items:
                     print("No blob files found under the specified folder prefixes.")
@@ -211,6 +222,9 @@ def log_metrics(
                     print("First failure:", failures[0])
                     if len(failures) < 6:
                         print("All failures:", failures)
+                    raise RuntimeError(
+                        "One or more artifact downloads failed; aborting replay step."
+                    )
                 # Write summary file for visibility
                 try:
                     summary_path = base_outputs / "_replay_download_summary.json"
