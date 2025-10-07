@@ -181,3 +181,4 @@ logs/*.log
 todos.md
 data/*
 artifacts_export/*
+*instructions.md

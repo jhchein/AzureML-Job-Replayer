@@ -106,7 +106,8 @@ Create `config/source_config.json` & `config/target_config.json` from the provid
 {
   "subscription_id": "<SUBSCRIPTION_ID>",
   "resource_group": "<RESOURCE_GROUP>",
-  "workspace_name": "<WORKSPACE_NAME>"
+  "workspace_name": "<WORKSPACE_NAME>",
+  "tenant_id": "<TENANT_ID>"
 }
 ```
 
