@@ -10,6 +10,7 @@ target:
   resource_group: "bosch-adas"
   workspace_name: "target-dummy"
 mltables:
-  - name: Anonymize-Bike-Videos_20240301_144340
   - name: green-quickstart
     versions: [2023.05.05.065003]
+  - name: Anonymize-Bike-Videos_20240301_144340
+    versions: [1]
