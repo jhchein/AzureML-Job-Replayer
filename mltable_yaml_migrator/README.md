@@ -1,6 +1,6 @@
 # Minimal MLTable YAML Migrator
 
-Exports only MLTable YAML definitions + minimal manifest, and re-imports them in another workspace without copying underlying data.
+Exports MLTable YAML definitions + minimal manifest, and re-imports them in another workspace while copying all co-located blobs directly between datastores (no local staging).
 
 ## Selection File Schema
 
@@ -41,11 +41,16 @@ CLI overrides (subscription / resource-group / workspace) take precedence over t
 ## Export
 
 ```bash
-# Use workspace from selection.source
+# Use workspace from selection.source (authenticate once via `az login`; the tool requests per-tenant tokens automatically)
 python export_yaml.py --selection selection.yaml --out-dir exported_mltables
 
 # Override source workspace explicitly
-python export_yaml.py --selection selection.yaml --subscription SUB --resource-group RG --workspace WS --out-dir exported_mltables
+python export_yaml.py \
+  --selection selection.yaml \
+  --subscription SUB \
+  --resource-group RG \
+  --workspace WS \
+  --out-dir exported_mltables
 
 # Dry run (no files written)
 python export_yaml.py --selection selection.yaml --out-dir exported_mltables --dry-run
@@ -68,15 +73,45 @@ exported_mltables/
 ## Import
 
 ```bash
-# Use target workspace from selection.target
-python import_yaml.py --selection selection.yaml --source-dir exported_mltables --on-exists fail|skip|suffix
+# Copy blobs + register using selection.source/target (preferred)
+python import_yaml.py \
+  --selection selection.yaml \
+  --source-dir exported_mltables \
+  --on-exists fail|skip|suffix
 
-# Explicit overrides
-python import_yaml.py --selection selection.yaml --subscription SUB --resource-group RG --workspace WS --source-dir exported_mltables
+# Explicit overrides (supply both source and target workspaces)
+python import_yaml.py \
+  --source-subscription SUB_SRC \
+  --source-resource-group RG_SRC \
+  --source-workspace WS_SRC \
+  --subscription SUB_TGT \
+  --resource-group RG_TGT \
+  --workspace WS_TGT \
+  --source-dir exported_mltables
 
-# Dry run (no registration)
+# Optional: isolate copies under a custom prefix and allow overwriting existing blobs
+python import_yaml.py \
+  --selection selection.yaml \
+  --source-dir exported_mltables \
+  --target-prefix migrations/batch-001 \
+  --copy-concurrency 16 \
+  --data-overwrite
+
+# Dry run (no data copy, no registration)
 python import_yaml.py --selection selection.yaml --source-dir exported_mltables --dry-run
+
+# Legacy behaviour (retain original paths; no blob copy)
+python import_yaml.py --selection selection.yaml --source-dir exported_mltables --skip-data-copy
 ```
+
+Key flags:
+
+- `--source-*` & `--subscription/--resource-group/--workspace` – allow CLI overrides when the selection file lacks workspace metadata. Provide matching tenant IDs with `--source-tenant` / `--tenant` for cross-tenant moves.
+- Both workspaces can be accessed after a single `az login` as long as the signed-in principal has RBAC in each tenant; no additional logins are required.
+- `--target-prefix` – prepend a folder (e.g. `migrations/batch-42`) to every copied path inside the target datastore.
+- `--copy-concurrency` (default **12**) – number of parallel blob copy workers.
+- `--data-overwrite` – delete existing blobs at the target prefix before copying.
+- `--skip-data-copy` – register assets without moving data (falling back to scope rewrite rules).
 
 Collision strategies (when an asset version already exists):
 
@@ -88,7 +123,7 @@ Scope rewrite (azureml:// path from different workspace):
 
 --on-scope-mismatch options:
 
-- rewrite (default) – substitute subscription/resourceGroup/workspace with target while preserving datastore + relative path.
+- rewrite (default) – substitute subscription/resourceGroup/workspace with target while preserving datastore + relative path. With data copy enabled this happens automatically once blobs land in the target workspace.
 - skip – do not import that asset.
 - fail – abort on first mismatch.
 

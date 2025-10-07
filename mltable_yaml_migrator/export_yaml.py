@@ -24,11 +24,11 @@ import argparse
 import json
 from pathlib import Path
 from typing import Iterable
-from azure.identity import DefaultAzureCredential
+from azure.identity import AzureCliCredential
 from azure.ai.ml import MLClient
 from azure.ai.ml.entities import Data
-from selection import SelectionSpec
-from util_logging import log
+from .selection import SelectionSpec
+from .util_logging import log
 
 
 def iter_datasets(
@@ -105,7 +105,7 @@ def main():
     target_dir = Path(args.out_dir)
     if not args.dry_run:
         target_dir.mkdir(parents=True, exist_ok=True)
-    cred = DefaultAzureCredential()
+    cred = AzureCliCredential()
     # Resolve workspace from CLI overrides or selection.source
     if args.subscription and args.resource_group and args.workspace:
         sub = args.subscription
