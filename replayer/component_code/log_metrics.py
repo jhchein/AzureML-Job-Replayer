@@ -1,11 +1,12 @@
 import argparse
 import json
 import os
-import mlflow
 import shutil
 import time
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+import mlflow
 from azure.storage.blob import BlobClient, ContainerClient
 
 
@@ -216,7 +217,9 @@ def log_metrics(
 
                 elapsed = time.time() - start_time
                 print(
-                    f"Artifact download summary: total={len(work_items)} success={success} failed={len(failures)} bytes={total_bytes} time_sec={elapsed:.2f}"
+                    f"Artifact download summary: total={len(work_items)}"
+                    f" success={success} failed={len(failures)}"
+                    f" bytes={total_bytes} time_sec={elapsed:.2f}"
                 )
                 if failures:
                     print("First failure:", failures[0])

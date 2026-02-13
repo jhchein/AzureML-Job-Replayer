@@ -2,15 +2,15 @@ import argparse
 import json
 import logging
 import os
+import random as _rand  # jitter for retries
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, Future
 from collections import deque
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from threading import Lock
 from typing import Any, Dict, List, Optional, Set, Tuple
-import random as _rand  # jitter for retries
 
 import mlflow
 from azure.ai.ml import MLClient
@@ -92,7 +92,12 @@ def safe_duration(start: Any, end: Any) -> Optional[float]:
             )
             return None
         logger.warning(
-            f"Could not parse start ({start}, type: {type(start)}) or end ({end}, type: {type(end)}) time for duration calculation."
+            "Could not parse start (%s, type: %s) or end (%s, type: %s)"
+            " time for duration calculation.",
+            start,
+            type(start),
+            end,
+            type(end),
         )
         return None
     except (ValueError, TypeError, OverflowError, date_parser.ParserError) as e:  # type: ignore[attr-defined]
@@ -763,11 +768,15 @@ def main(
         missing_requested = missing_requested_list
         if missing_requested:
             logger.warning(
-                f"{len(missing_requested)} requested top-level job name(s) not found and were skipped: {missing_requested}"
+                "%d requested top-level job name(s) not found and were skipped: %s",
+                len(missing_requested),
+                missing_requested,
             )
 
     print(
-        f"\nSuccessfully extracted {job_count} total jobs (including descendants) to {output_path} in {elapsed:.2f}s (parallel={parallel})"
+        f"\nSuccessfully extracted {job_count} total jobs"
+        f" (including descendants) to {output_path}"
+        f" in {elapsed:.2f}s (parallel={parallel})"
     )
 
 
@@ -793,6 +802,7 @@ def _parse_include_args(args) -> Optional[Set[str]]:
                     if name:
                         include_names.add(name)
         except OSError as e:
+            logger.warning("Failed to read include file '%s': %s", args.include_file, e)
             print(f"WARNING: Failed to read include file '{args.include_file}': {e}")
     if not include_names:
         return None

@@ -1,4 +1,4 @@
-from azure.ai.ml import command, Input
+from azure.ai.ml import Input, command
 from azure.ai.ml.constants import AssetTypes
 from azure.ai.ml.entities import Environment
 
@@ -29,6 +29,12 @@ replay_metrics_component = command(
         "artifact_manifest": Input(type=AssetTypes.URI_FILE),
     },
     code="./replayer/component_code",
-    command="python log_metrics.py --job-id ${{inputs.original_job_id}} --metrics-file ${{inputs.metrics_file}} --artifact-manifest ${{inputs.artifact_manifest}} --copy-artifacts",
+    command=(
+        "python log_metrics.py"
+        " --job-id ${{inputs.original_job_id}}"
+        " --metrics-file ${{inputs.metrics_file}}"
+        " --artifact-manifest ${{inputs.artifact_manifest}}"
+        " --copy-artifacts"
+    ),
     environment=DUMMY_ENV,
 )
