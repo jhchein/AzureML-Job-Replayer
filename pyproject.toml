@@ -12,15 +12,38 @@ dependencies = [
     "python-dateutil>=2.9.0.post0",
     "tqdm>=4.65.0",
     "PyYAML>=6.0",
+    "azure-storage-blob>=12.5.0",
 ]
 
 [tool.setuptools]
-packages = ["mltable_yaml_migrator"]
+packages = ["extractor", "replayer", "utils", "mltable_yaml_migrator"]
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
+[dependency-groups]
+dev = [
+    "ruff>=0.15.0",
+]
+
 [tool.pytest.ini_options]
 addopts = "-q"
 pythonpath = ["."]
+filterwarnings = [
+    # Upstream dep noise — not actionable until azureml-mlflow / azure-ai-ml update
+    "ignore::DeprecationWarning:google.protobuf.*",
+    "ignore::DeprecationWarning:pydantic.*",
+    "ignore::marshmallow.warnings.ChangedInMarshmallow4Warning",
+    "ignore::marshmallow.warnings.RemovedInMarshmallow4Warning",
+]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/conftest.py" = ["F401"]
