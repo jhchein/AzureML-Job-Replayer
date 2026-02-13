@@ -1,8 +1,10 @@
 from __future__ import annotations
+
 import dataclasses as dc
 from pathlib import Path
+from typing import Any, Dict, List, Optional
+
 import yaml
-from typing import List, Dict, Any, Optional
 
 
 @dc.dataclass
