@@ -1,0 +1,19 @@
+# MLTable selection file for the mltable_yaml_migrator.
+# Copy this file to mltables.yaml and fill in your workspace details.
+# See mltable_yaml_migrator/README.md for the full schema.
+
+batch_id: my-batch-001
+source:
+  tenant_id: "00000000-0000-0000-0000-000000000000"
+  subscription_id: "00000000-0000-0000-0000-000000000000"
+  resource_group: "rg-source"
+  workspace_name: "ws-source"
+target:
+  tenant_id: "00000000-0000-0000-0000-000000000000"
+  subscription_id: "00000000-0000-0000-0000-000000000000"
+  resource_group: "rg-target"
+  workspace_name: "ws-target"
+mltables:
+  - name: my-table
+    versions: [1, 2]
+  - name: another-table

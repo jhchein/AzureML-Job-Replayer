@@ -183,6 +183,7 @@ logs/*.log
 # Sensitive / local data
 data/*
 artifacts_export/*
+mltables.yaml
 
 # Project spec MUST NEVER BE COMMITTED TO GIT!!! FFS
 project-spec/ 

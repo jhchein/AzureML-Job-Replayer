@@ -38,6 +38,12 @@ mltables:
 
 CLI overrides (subscription / resource-group / workspace) take precedence over the YAML. If source/target blocks are omitted you MUST provide CLI values.
 
+### Setup
+
+```bash
+cp mltables.yaml.example mltables.yaml   # then edit with your workspace details
+```
+
 ## Export
 
 ```bash
