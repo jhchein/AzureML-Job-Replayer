@@ -4,9 +4,12 @@ import json
 
 from extractor.extract_jobs import JobMetadata
 from replayer.build_pipeline import (
+    _classify_replay_units,
     _compute_depths,
     _create_disabled_manifest,
     _index_jobs,
+    _infer_parent_links,
+    _load_manifest,
 )
 
 # ── helpers ─────────────────────────────────────────────────────────
@@ -147,3 +150,190 @@ class TestCreateDisabledManifest:
         p1 = _create_disabled_manifest("same_job")
         p2 = _create_disabled_manifest("same_job")
         assert p1 != p2
+
+
+# ── _load_manifest ──────────────────────────────────────────────────
+
+
+class TestLoadManifest:
+    def test_loads_valid_json(self, tmp_path):
+        """Round-trip: write list of dicts, load back as (raw, JobMetadata list)."""
+        data = [{"name": "j1", "job_type": "command"}, {"name": "j2", "job_type": "pipeline"}]
+        p = tmp_path / "jobs.json"
+        p.write_text(json.dumps(data))
+        jobs_raw, jobs_meta = _load_manifest(str(p))
+        assert len(jobs_raw) == 2
+        assert len(jobs_meta) == 2
+        assert jobs_meta[0].name == "j1"
+        assert jobs_meta[1].job_type == "pipeline"
+
+    def test_returns_raw_dicts_unchanged(self, tmp_path):
+        """The raw list should be the original parsed dicts, not a copy."""
+        data = [{"name": "j1", "description": "keep me"}]
+        p = tmp_path / "jobs.json"
+        p.write_text(json.dumps(data))
+        jobs_raw, _ = _load_manifest(str(p))
+        assert jobs_raw[0]["description"] == "keep me"
+
+    def test_missing_file_raises(self, tmp_path):
+        """Non-existent path should raise FileNotFoundError."""
+        import pytest
+
+        with pytest.raises(FileNotFoundError):
+            _load_manifest(str(tmp_path / "missing.json"))
+
+    def test_invalid_json_raises(self, tmp_path):
+        """Malformed JSON should raise."""
+        import pytest
+
+        p = tmp_path / "bad.json"
+        p.write_text("{not valid json")
+        with pytest.raises(json.JSONDecodeError):
+            _load_manifest(str(p))
+
+    def test_empty_list(self, tmp_path):
+        """Empty list should return two empty collections."""
+        p = tmp_path / "empty.json"
+        p.write_text("[]")
+        jobs_raw, jobs_meta = _load_manifest(str(p))
+        assert jobs_raw == []
+        assert jobs_meta == []
+
+
+# ── _infer_parent_links ────────────────────────────────────────────
+
+
+class TestInferParentLinks:
+    def test_no_inference_when_parent_already_set(self):
+        """Jobs with existing parent_job_name should not be changed."""
+        parent = _jm("pipe1", job_type="pipeline")
+        child = _jm("c1", parent="pipe1")
+        child.job_properties = {"azureml.pipelinerunid": "pipe1"}
+        jobs = [parent, child]
+        by_name, _, pipeline_names = _index_jobs(jobs)
+        count = _infer_parent_links(jobs, by_name, pipeline_names)
+        assert count == 0
+        assert child.parent_job_name == "pipe1"
+
+    def test_infers_from_pipelinerunid(self):
+        """Should set parent_job_name from azureml.pipelinerunid."""
+        parent = _jm("pipe1", job_type="pipeline")
+        orphan = _jm("step1")
+        orphan.job_properties = {"azureml.pipelinerunid": "pipe1"}
+        jobs = [parent, orphan]
+        by_name, _, pipeline_names = _index_jobs(jobs)
+        count = _infer_parent_links(jobs, by_name, pipeline_names)
+        assert count == 1
+        assert orphan.parent_job_name == "pipe1"
+
+    def test_infers_from_azureml_pipeline_fallback(self):
+        """Should fall back to azureml.pipeline if pipelinerunid is absent."""
+        parent = _jm("pipe2", job_type="pipeline")
+        orphan = _jm("step2")
+        orphan.job_properties = {"azureml.pipeline": "pipe2"}
+        jobs = [parent, orphan]
+        by_name, _, pipeline_names = _index_jobs(jobs)
+        count = _infer_parent_links(jobs, by_name, pipeline_names)
+        assert count == 1
+        assert orphan.parent_job_name == "pipe2"
+
+    def test_no_inference_when_candidate_not_pipeline(self):
+        """Candidate parent must be in pipeline_names to be inferred."""
+        cmd = _jm("cmd1")
+        orphan = _jm("step3")
+        orphan.job_properties = {"azureml.pipelinerunid": "cmd1"}
+        jobs = [cmd, orphan]
+        by_name, _, pipeline_names = _index_jobs(jobs)
+        count = _infer_parent_links(jobs, by_name, pipeline_names)
+        assert count == 0
+        assert orphan.parent_job_name is None
+
+    def test_no_self_reference(self):
+        """A job should not infer itself as parent."""
+        pipe = _jm("pipe_self", job_type="pipeline")
+        pipe.job_properties = {"azureml.pipelinerunid": "pipe_self"}
+        jobs = [pipe]
+        by_name, _, pipeline_names = _index_jobs(jobs)
+        count = _infer_parent_links(jobs, by_name, pipeline_names)
+        assert count == 0
+
+    def test_candidate_must_exist_in_manifest(self):
+        """Candidate parent must exist in jobs_by_name."""
+        orphan = _jm("lonely")
+        orphan.job_properties = {"azureml.pipelinerunid": "nonexistent_pipe"}
+        jobs = [orphan]
+        by_name, _, pipeline_names = _index_jobs(jobs)
+        count = _infer_parent_links(jobs, by_name, pipeline_names)
+        assert count == 0
+
+
+# ── _classify_replay_units ──────────────────────────────────────────
+
+
+class TestClassifyReplayUnits:
+    def test_single_standalone(self):
+        """A lone command job produces one standalone replay unit."""
+        jobs = [_jm("cmd1")]
+        by_name, _, pipeline_names = _index_jobs(jobs)
+        replay_units, depths, children = _classify_replay_units(jobs, pipeline_names, by_name)
+        assert replay_units == [("standalone", "cmd1")]
+        assert depths == {}
+        assert children == {}
+
+    def test_pipeline_with_children(self):
+        """Pipeline with children: pipeline comes first as replay unit, child is not standalone."""
+        parent = _jm("pipe1", job_type="pipeline")
+        child = _jm("c1", parent="pipe1")
+        jobs = [parent, child]
+        by_name, _, pipeline_names = _index_jobs(jobs)
+        replay_units, depths, children = _classify_replay_units(jobs, pipeline_names, by_name)
+        assert ("pipeline", "pipe1") in replay_units
+        # child is NOT a standalone root (it has a parent)
+        assert ("standalone", "c1") not in replay_units
+        assert children["pipe1"] == ["c1"]
+        assert depths["pipe1"] == 0
+
+    def test_nested_pipelines_ordered_by_depth(self):
+        """Nested pipelines should be ordered by increasing depth."""
+        root = _jm("root_pipe", job_type="pipeline")
+        nested = _jm("nested_pipe", job_type="pipeline", parent="root_pipe")
+        leaf = _jm("leaf", parent="nested_pipe")
+        jobs = [root, nested, leaf]
+        by_name, _, pipeline_names = _index_jobs(jobs)
+        replay_units, depths, children = _classify_replay_units(jobs, pipeline_names, by_name)
+        pipe_units = [u for u in replay_units if u[0] == "pipeline"]
+        assert pipe_units[0] == ("pipeline", "root_pipe")
+        assert pipe_units[1] == ("pipeline", "nested_pipe")
+        assert depths["root_pipe"] == 0
+        assert depths["nested_pipe"] == 1
+
+    def test_standalone_roots_sorted_alphabetically(self):
+        """Standalone root commands should be sorted by name."""
+        jobs = [_jm("z_job"), _jm("a_job"), _jm("m_job")]
+        by_name, _, pipeline_names = _index_jobs(jobs)
+        replay_units, _, _ = _classify_replay_units(jobs, pipeline_names, by_name)
+        names = [u[1] for u in replay_units]
+        assert names == ["a_job", "m_job", "z_job"]
+
+    def test_pipelines_come_before_standalones(self):
+        """In replay_units, all pipelines appear before standalone roots."""
+        pipe = _jm("pipe1", job_type="pipeline")
+        cmd = _jm("standalone1")
+        jobs = [cmd, pipe]
+        by_name, _, pipeline_names = _index_jobs(jobs)
+        replay_units, _, _ = _classify_replay_units(jobs, pipeline_names, by_name)
+        assert replay_units[0] == ("pipeline", "pipe1")
+        assert replay_units[1] == ("standalone", "standalone1")
+
+    def test_mixed_hierarchy(self, sample_jobs_list):
+        """Uses conftest fixture: standalone, pipeline parent, child."""
+        jobs = [JobMetadata(**d) for d in sample_jobs_list]
+        by_name, _, pipeline_names = _index_jobs(jobs)
+        replay_units, depths, children = _classify_replay_units(jobs, pipeline_names, by_name)
+        # pipeline_parent_001 is a replay unit
+        assert ("pipeline", "pipeline_parent_001") in replay_units
+        # happy_mango_abc123 is standalone root (no parent)
+        assert ("standalone", "happy_mango_abc123") in replay_units
+        # child_step_001 is NOT a standalone root
+        assert ("standalone", "child_step_001") not in replay_units
+        assert "child_step_001" in children["pipeline_parent_001"]

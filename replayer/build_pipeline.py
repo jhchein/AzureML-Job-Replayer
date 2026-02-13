@@ -112,6 +112,115 @@ def _create_disabled_manifest(run_id: str) -> str:
     return path
 
 
+def _load_manifest(input_path: str) -> Tuple[List[dict], List[JobMetadata]]:
+    """Load and parse a jobs manifest JSON file.
+
+    Returns:
+        Tuple of (raw dicts list, list of JobMetadata instances).
+
+    Raises:
+        FileNotFoundError: if the file does not exist.
+        json.JSONDecodeError: if the file is not valid JSON.
+    """
+    with open(input_path, "r", encoding="utf-8") as f:
+        jobs_raw = json.load(f)
+    all_jobs_metadata = [JobMetadata(**j) for j in jobs_raw]
+    return jobs_raw, all_jobs_metadata
+
+
+def _infer_parent_links(
+    all_jobs_metadata: List[JobMetadata],
+    jobs_by_name: Dict[str, JobMetadata],
+    pipeline_names: Set[str],
+) -> int:
+    """Infer missing parent relationships from provenance properties.
+
+    Mutates ``parent_job_name`` on jobs where a pipeline parent can be
+    inferred from ``azureml.pipelinerunid`` or ``azureml.pipeline``.
+
+    Returns the number of links inferred.
+    """
+    inferred = 0
+    for jm in all_jobs_metadata:
+        try:
+            if jm.parent_job_name:
+                continue
+            props = jm.job_properties or {}
+            candidate = props.get("azureml.pipelinerunid") or props.get(
+                "azureml.pipeline"
+            )
+            if (
+                candidate
+                and candidate in jobs_by_name
+                and candidate in pipeline_names
+                and candidate != jm.name
+            ):
+                jm.parent_job_name = candidate  # type: ignore[attr-defined]
+                inferred += 1
+        except Exception:  # noqa: BLE001
+            continue
+    return inferred
+
+
+def _classify_replay_units(
+    all_jobs_metadata: List[JobMetadata],
+    pipeline_names: Set[str],
+    jobs_by_name: Dict[str, JobMetadata],
+) -> Tuple[List[Tuple[str, str]], Dict[str, int], Dict[str, List[str]]]:
+    """Classify jobs into ordered replay units.
+
+    Returns:
+        replay_units: ordered list of (unit_type, job_name) tuples.
+        pipeline_depths: pipeline name -> nesting depth (0 = root).
+        pipeline_children: pipeline name -> list of direct child names.
+    """
+    # Build children map and leaf set
+    pipeline_children: Dict[str, List[str]] = {name: [] for name in pipeline_names}
+    for jm in all_jobs_metadata:
+        if jm.parent_job_name and jm.parent_job_name in pipeline_children:
+            pipeline_children[jm.parent_job_name].append(jm.name)
+
+    # Determine root vs nested pipelines
+    parent_pipeline_of: Dict[str, Optional[str]] = {}
+    for p in pipeline_names:
+        parent_name = jobs_by_name[p].parent_job_name
+        if parent_name and parent_name in pipeline_names:
+            parent_pipeline_of[p] = parent_name
+        else:
+            parent_pipeline_of[p] = None
+
+    # Compute pipeline depths
+    pipeline_depths: Dict[str, int] = {}
+
+    def _depth(p: str) -> int:
+        if p in pipeline_depths:
+            return pipeline_depths[p]
+        parent = parent_pipeline_of.get(p)
+        if not parent:
+            pipeline_depths[p] = 0
+            return 0
+        d = 1 + _depth(parent)
+        pipeline_depths[p] = d
+        return d
+
+    for p in pipeline_names:
+        _depth(p)
+
+    # Order: pipelines by depth then name, then standalone roots alphabetically
+    pipeline_order = sorted(
+        pipeline_names, key=lambda n: (pipeline_depths.get(n, 0), n)
+    )
+    standalone_root_commands = sorted(
+        jm.name
+        for jm in all_jobs_metadata
+        if (jm.name not in pipeline_names) and not jm.parent_job_name
+    )
+    replay_units: List[Tuple[str, str]] = [("pipeline", n) for n in pipeline_order] + [
+        ("standalone", n) for n in standalone_root_commands
+    ]
+    return replay_units, pipeline_depths, pipeline_children
+
+
 def build_dummy_pipeline_for_children(
     parent_job: JobMetadata,
     child_jobs: List[JobMetadata],
@@ -290,9 +399,7 @@ def main(args):
 
     print("Loading job metadata...")
     try:
-        with open(args.input, "r", encoding="utf-8") as f:
-            jobs_raw = json.load(f)
-            all_jobs_metadata = [JobMetadata(**j) for j in jobs_raw]
+        jobs_raw, all_jobs_metadata = _load_manifest(args.input)
         print(f"Loaded {len(all_jobs_metadata)} job metadata records.")
     except Exception as e:
         logger.error("Error loading or parsing %s: %s", args.input, e)
@@ -304,28 +411,7 @@ def main(args):
     depths = _compute_depths(jobs_by_name)
 
     # --- Infer missing parent relationships (some extracts have parent_job_name=null) ---
-    inferred_links = 0
-    for jm in all_jobs_metadata:
-        try:
-            if jm.parent_job_name:  # already set
-                continue
-            props = jm.job_properties or {}
-            # Prefer explicit pipelinerun id, fall back to 'azureml.pipeline'
-            candidate_parent = props.get("azureml.pipelinerunid") or props.get(
-                "azureml.pipeline"
-            )
-            if (
-                candidate_parent
-                and candidate_parent in jobs_by_name
-                and candidate_parent in pipeline_names
-                and candidate_parent != jm.name
-            ):
-                # Set inferred parent
-                jm.parent_job_name = candidate_parent  # type: ignore[attr-defined]
-                inferred_links += 1
-        except Exception:
-            # Non-fatal; continue trying others
-            continue
+    inferred_links = _infer_parent_links(all_jobs_metadata, jobs_by_name, pipeline_names)
     if inferred_links:
         print(
             f"Inferred {inferred_links} pipeline child relationship(s)"
@@ -496,63 +582,19 @@ def main(args):
         print(f"Prepared {len(manifests_by_job)} artifact manifest file(s).")
 
     # --- Hierarchical classification ---
-    # Build set of pipeline nodes (job_type==pipeline) and map their direct children.
-    pipeline_children: Dict[str, List[str]] = {name: [] for name in pipeline_names}
-    leaf_command_jobs: Set[str] = set()
-    for jm in all_jobs_metadata:
-        if jm.parent_job_name and jm.parent_job_name in pipeline_children:
-            # classify as child of a pipeline
-            pipeline_children[jm.parent_job_name].append(jm.name)
-        jt = (jm.job_type or "").lower()
-        if jt != "pipeline":
-            leaf_command_jobs.add(jm.name)
-
-    # Determine root pipelines (no parent pipeline) and nested pipelines (have parent pipeline)
-    parent_pipeline_of: Dict[str, Optional[str]] = {}
-    for p in pipeline_names:
-        parent_name = jobs_by_name[p].parent_job_name
-        if parent_name and parent_name in pipeline_names:
-            parent_pipeline_of[p] = parent_name
-        else:
-            parent_pipeline_of[p] = None
-    root_pipelines = [p for p, par in parent_pipeline_of.items() if par is None]
-    # nested_pipelines list not needed directly; retained via parent_pipeline_of
-
-    # Attach depth information for pipelines
-    pipeline_depths: Dict[str, int] = {}
-
-    def compute_pipeline_depth(p: str) -> int:
-        if p in pipeline_depths:
-            return pipeline_depths[p]
-        parent = parent_pipeline_of.get(p)
-        if not parent:
-            pipeline_depths[p] = 0
-            return 0
-        d = 1 + compute_pipeline_depth(parent)
-        pipeline_depths[p] = d
-        return d
-
-    for p in pipeline_names:
-        compute_pipeline_depth(p)
-
-    # Build replay units: process pipelines in increasing depth,
-    # then standalone command roots (those without parent and not pipelines)
-    pipeline_order = sorted(
-        pipeline_names, key=lambda n: (pipeline_depths.get(n, 0), n)
+    replay_units, pipeline_depths, pipeline_children = _classify_replay_units(
+        all_jobs_metadata, pipeline_names, jobs_by_name
     )
-    standalone_root_commands = [
-        jm.name
-        for jm in all_jobs_metadata
-        if (jm.name not in pipeline_names) and not jm.parent_job_name
+    # Compute root pipelines for debug tree (pipelines with no pipeline parent)
+    root_pipelines = [
+        p for p in pipeline_names
+        if not (jobs_by_name[p].parent_job_name and jobs_by_name[p].parent_job_name in pipeline_names)
     ]
-    standalone_root_commands = sorted(standalone_root_commands)
-    replay_units: List[Tuple[str, str]] = [("pipeline", n) for n in pipeline_order] + [
-        ("standalone", n) for n in standalone_root_commands
-    ]
+    standalone_count = sum(1 for t, _ in replay_units if t == "standalone")
     print(
         f"Prepared {len(replay_units)} replay units"
         f" (pipelines={len(pipeline_names)},"
-        f" standalone_roots={len(standalone_root_commands)})."
+        f" standalone_roots={standalone_count})."
     )
     if args.debug_hierarchy:
         print("\nHierarchy Debug Tree (pipelines only):")
@@ -696,9 +738,9 @@ def main(args):
                     if tags_dict is not None and isinstance(tags_dict, dict):
                         depth_val = pipeline_depths.get(parent_meta.name, 0)
                         tags_dict[PIPELINE_DEPTH_TAG] = str(depth_val)
-                        parent_pipeline = parent_pipeline_of.get(parent_meta.name)
-                        if parent_pipeline:
-                            tags_dict[ORIGINAL_PARENT_PIPELINE_ID_TAG] = parent_pipeline
+                        parent_name = parent_meta.parent_job_name
+                        if parent_name and parent_name in pipeline_names:
+                            tags_dict[ORIGINAL_PARENT_PIPELINE_ID_TAG] = parent_name
             else:
                 print(f" -> Unknown unit type '{unit_type}'. Skipping.")
                 skipped_count += 1
