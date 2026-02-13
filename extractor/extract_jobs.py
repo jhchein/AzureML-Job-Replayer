@@ -267,9 +267,18 @@ class MlflowData:
 
 
 _EMPTY_MLFLOW_DATA = MlflowData(
-    metrics={}, params={}, tags={}, dataset_inputs=None,
-    run_id=None, run_name=None, experiment_id=None, user_id=None,
-    artifact_uri=None, start_time_ms=None, end_time_ms=None, script_name=None,
+    metrics={},
+    params={},
+    tags={},
+    dataset_inputs=None,
+    run_id=None,
+    run_name=None,
+    experiment_id=None,
+    user_id=None,
+    artifact_uri=None,
+    start_time_ms=None,
+    end_time_ms=None,
+    script_name=None,
 )
 
 
@@ -284,13 +293,27 @@ def _fetch_mlflow_data(mlflow_client: MlflowClient, job_name: str) -> MlflowData
         if "RESOURCE_DOES_NOT_EXIST" in str(e) or (
             "Run with id=" in str(e) and "not found" in str(e)
         ):
-            logger.info("No MLflow run found for job %s. This might be expected.", job_name)
+            logger.info(
+                "No MLflow run found for job %s. This might be expected.", job_name
+            )
         else:
             logger.warning("MLflow Error retrieving run for job %s: %s", job_name, e)
-        return MlflowData(**{f.name: getattr(_EMPTY_MLFLOW_DATA, f.name) for f in fields(_EMPTY_MLFLOW_DATA)})
+        return MlflowData(
+            **{
+                f.name: getattr(_EMPTY_MLFLOW_DATA, f.name)
+                for f in fields(_EMPTY_MLFLOW_DATA)
+            }
+        )
     except Exception as e:  # noqa: BLE001
-        logger.warning("Unexpected Error retrieving MLflow run for job %s: %s", job_name, e)
-        return MlflowData(**{f.name: getattr(_EMPTY_MLFLOW_DATA, f.name) for f in fields(_EMPTY_MLFLOW_DATA)})
+        logger.warning(
+            "Unexpected Error retrieving MLflow run for job %s: %s", job_name, e
+        )
+        return MlflowData(
+            **{
+                f.name: getattr(_EMPTY_MLFLOW_DATA, f.name)
+                for f in fields(_EMPTY_MLFLOW_DATA)
+            }
+        )
 
     metrics: Dict[str, Any] = {}
     params: Dict[str, Any] = {}
@@ -312,7 +335,9 @@ def _fetch_mlflow_data(mlflow_client: MlflowClient, job_name: str) -> MlflowData
         script_name = tags_dict.get("mlflow.source.name")
         logger.info(
             "Retrieved %d metrics, %d params for MLflow run %s",
-            len(metrics), len(params), job_name,
+            len(metrics),
+            len(params),
+            job_name,
         )
     if mlflow_run and mlflow_run.info:
         run_id = mlflow_run.info.run_id
@@ -330,10 +355,17 @@ def _fetch_mlflow_data(mlflow_client: MlflowClient, job_name: str) -> MlflowData
         dataset_inputs = convert_complex_dict(mlflow_run.inputs.dataset_inputs)
 
     return MlflowData(
-        metrics=metrics, params=params, tags=tags_dict,
-        dataset_inputs=dataset_inputs, run_id=run_id, run_name=run_name,
-        experiment_id=experiment_id, user_id=user_id, artifact_uri=artifact_uri,
-        start_time_ms=start_time_ms, end_time_ms=end_time_ms,
+        metrics=metrics,
+        params=params,
+        tags=tags_dict,
+        dataset_inputs=dataset_inputs,
+        run_id=run_id,
+        run_name=run_name,
+        experiment_id=experiment_id,
+        user_id=user_id,
+        artifact_uri=artifact_uri,
+        start_time_ms=start_time_ms,
+        end_time_ms=end_time_ms,
         script_name=script_name,
     )
 
@@ -376,8 +408,12 @@ def _extract_creation_context(job: Job) -> Dict[str, Optional[str]]:
     ctx = getattr(job, "creation_context", None)
     if ctx is None:
         return {
-            "created_at": None, "created_by": None, "created_by_type": None,
-            "last_modified_at": None, "last_modified_by": None, "last_modified_by_type": None,
+            "created_at": None,
+            "created_by": None,
+            "created_by_type": None,
+            "last_modified_at": None,
+            "last_modified_by": None,
+            "last_modified_by_type": None,
         }
     return {
         "created_at": safe_isoformat(getattr(ctx, "created_at", None)),
@@ -403,7 +439,11 @@ def _resolve_timestamps(
     prop_end = job_properties.get("EndTimeUtc") if job_properties else None
     start_raw = mlflow_start_ms if mlflow_start_ms is not None else prop_start
     end_raw = mlflow_end_ms if mlflow_end_ms is not None else prop_end
-    return safe_isoformat(start_raw), safe_isoformat(end_raw), safe_duration(start_raw, end_raw)
+    return (
+        safe_isoformat(start_raw),
+        safe_isoformat(end_raw),
+        safe_duration(start_raw, end_raw),
+    )
 
 
 def _process_job_object(job: Job, mlflow_client: MlflowClient) -> Optional[JobMetadata]:
@@ -421,13 +461,17 @@ def _process_job_object(job: Job, mlflow_client: MlflowClient) -> Optional[JobMe
     job_properties = getattr(job, "properties", None)
     code_obj = getattr(job, "code", None)
     identity_obj = getattr(job, "identity", None)
-    resources_obj = getattr(job, "resources", None) if hasattr(job, "resources") else None
+    resources_obj = (
+        getattr(job, "resources", None) if hasattr(job, "resources") else None
+    )
 
     # --- Derived fields ---
     environment_name, environment_id = _extract_environment(job)
     ctx = _extract_creation_context(job)
     start_time, end_time, duration_seconds = _resolve_timestamps(
-        mf.start_time_ms, mf.end_time_ms, job_properties,
+        mf.start_time_ms,
+        mf.end_time_ms,
+        job_properties,
     )
 
     compute_id_from_props = None

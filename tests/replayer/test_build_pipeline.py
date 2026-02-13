@@ -158,7 +158,10 @@ class TestCreateDisabledManifest:
 class TestLoadManifest:
     def test_loads_valid_json(self, tmp_path):
         """Round-trip: write list of dicts, load back as (raw, JobMetadata list)."""
-        data = [{"name": "j1", "job_type": "command"}, {"name": "j2", "job_type": "pipeline"}]
+        data = [
+            {"name": "j1", "job_type": "command"},
+            {"name": "j2", "job_type": "pipeline"},
+        ]
         p = tmp_path / "jobs.json"
         p.write_text(json.dumps(data))
         jobs_raw, jobs_meta = _load_manifest(str(p))
@@ -275,7 +278,9 @@ class TestClassifyReplayUnits:
         """A lone command job produces one standalone replay unit."""
         jobs = [_jm("cmd1")]
         by_name, _, pipeline_names = _index_jobs(jobs)
-        replay_units, depths, children = _classify_replay_units(jobs, pipeline_names, by_name)
+        replay_units, depths, children = _classify_replay_units(
+            jobs, pipeline_names, by_name
+        )
         assert replay_units == [("standalone", "cmd1")]
         assert depths == {}
         assert children == {}
@@ -286,7 +291,9 @@ class TestClassifyReplayUnits:
         child = _jm("c1", parent="pipe1")
         jobs = [parent, child]
         by_name, _, pipeline_names = _index_jobs(jobs)
-        replay_units, depths, children = _classify_replay_units(jobs, pipeline_names, by_name)
+        replay_units, depths, children = _classify_replay_units(
+            jobs, pipeline_names, by_name
+        )
         assert ("pipeline", "pipe1") in replay_units
         # child is NOT a standalone root (it has a parent)
         assert ("standalone", "c1") not in replay_units
@@ -300,7 +307,9 @@ class TestClassifyReplayUnits:
         leaf = _jm("leaf", parent="nested_pipe")
         jobs = [root, nested, leaf]
         by_name, _, pipeline_names = _index_jobs(jobs)
-        replay_units, depths, children = _classify_replay_units(jobs, pipeline_names, by_name)
+        replay_units, depths, children = _classify_replay_units(
+            jobs, pipeline_names, by_name
+        )
         pipe_units = [u for u in replay_units if u[0] == "pipeline"]
         assert pipe_units[0] == ("pipeline", "root_pipe")
         assert pipe_units[1] == ("pipeline", "nested_pipe")
@@ -329,7 +338,9 @@ class TestClassifyReplayUnits:
         """Uses conftest fixture: standalone, pipeline parent, child."""
         jobs = [JobMetadata(**d) for d in sample_jobs_list]
         by_name, _, pipeline_names = _index_jobs(jobs)
-        replay_units, depths, children = _classify_replay_units(jobs, pipeline_names, by_name)
+        replay_units, depths, children = _classify_replay_units(
+            jobs, pipeline_names, by_name
+        )
         # pipeline_parent_001 is a replay unit
         assert ("pipeline", "pipeline_parent_001") in replay_units
         # happy_mango_abc123 is standalone root (no parent)

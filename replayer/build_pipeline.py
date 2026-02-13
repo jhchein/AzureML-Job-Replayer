@@ -411,7 +411,9 @@ def main(args):
     depths = _compute_depths(jobs_by_name)
 
     # --- Infer missing parent relationships (some extracts have parent_job_name=null) ---
-    inferred_links = _infer_parent_links(all_jobs_metadata, jobs_by_name, pipeline_names)
+    inferred_links = _infer_parent_links(
+        all_jobs_metadata, jobs_by_name, pipeline_names
+    )
     if inferred_links:
         print(
             f"Inferred {inferred_links} pipeline child relationship(s)"
@@ -587,8 +589,12 @@ def main(args):
     )
     # Compute root pipelines for debug tree (pipelines with no pipeline parent)
     root_pipelines = [
-        p for p in pipeline_names
-        if not (jobs_by_name[p].parent_job_name and jobs_by_name[p].parent_job_name in pipeline_names)
+        p
+        for p in pipeline_names
+        if not (
+            jobs_by_name[p].parent_job_name
+            and jobs_by_name[p].parent_job_name in pipeline_names
+        )
     ]
     standalone_count = sum(1 for t, _ in replay_units if t == "standalone")
     print(

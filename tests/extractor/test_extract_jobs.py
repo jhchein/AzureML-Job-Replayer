@@ -444,7 +444,8 @@ class TestResolveTimestamps:
 
     def test_mlflow_ms_preferred(self):
         start, end, dur = _resolve_timestamps(
-            1736935200000, 1736935260000,
+            1736935200000,
+            1736935260000,
             {"StartTimeUtc": "should-not-use", "EndTimeUtc": "should-not-use"},
         )
         assert start is not None
@@ -453,8 +454,12 @@ class TestResolveTimestamps:
 
     def test_fallback_to_properties(self):
         start, end, dur = _resolve_timestamps(
-            None, None,
-            {"StartTimeUtc": "2025-01-15T10:00:00Z", "EndTimeUtc": "2025-01-15T10:02:00Z"},
+            None,
+            None,
+            {
+                "StartTimeUtc": "2025-01-15T10:00:00Z",
+                "EndTimeUtc": "2025-01-15T10:02:00Z",
+            },
         )
         assert start is not None
         assert dur == pytest.approx(120.0)
@@ -462,7 +467,8 @@ class TestResolveTimestamps:
     def test_partial_mlflow(self):
         """MLflow has start but not end; end falls back to properties."""
         start, end, dur = _resolve_timestamps(
-            1736935200000, None,
+            1736935200000,
+            None,
             {"EndTimeUtc": "2025-01-15T12:00:00+00:00"},
         )
         assert start is not None
