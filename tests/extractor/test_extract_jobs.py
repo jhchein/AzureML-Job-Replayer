@@ -1,15 +1,22 @@
-"""Phase 1 tests for pure functions in extractor.extract_jobs."""
+"""Tests for pure functions and helpers in extractor.extract_jobs."""
 
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
+from mlflow.exceptions import MlflowException
 
 from extractor.extract_jobs import (
     JobMetadata,
+    MlflowData,
+    _extract_creation_context,
+    _extract_environment,
+    _fetch_mlflow_data,
     _get_default_artifact_folders,
     _is_transient,
     _parse_include_args,
+    _resolve_timestamps,
     convert_complex_dict,
     safe_duration,
     safe_isoformat,
@@ -340,3 +347,189 @@ class TestJobMetadataToDict:
         d = jm.to_dict()
         # to_dict converts keys via str()
         assert "123" in d["tags"]
+
+
+# ── _extract_environment ────────────────────────────────────────────
+
+
+class TestExtractEnvironment:
+    def test_no_environment(self):
+        job = SimpleNamespace(environment=None)
+        assert _extract_environment(job) == (None, None)
+
+    def test_string_env_with_colon(self):
+        # When the string has no '/', the whole string is treated as the name part
+        job = SimpleNamespace(environment="azureml:AzureML-sklearn:1")
+        name, eid = _extract_environment(job)
+        # name_part = "azureml:AzureML-sklearn:1" (has ":" but no "@")
+        assert name == "azureml:AzureML-sklearn:1"
+        assert eid == "azureml:AzureML-sklearn:1"
+
+    def test_string_env_with_colon_and_at(self):
+        job = SimpleNamespace(
+            environment="azureml://registries/azureml/environments/AzureML-sklearn:1@latest"
+        )
+        name, eid = _extract_environment(job)
+        assert name == "AzureML-sklearn:1"
+        assert eid is not None
+
+    def test_string_env_simple_name(self):
+        job = SimpleNamespace(environment="my-env")
+        name, eid = _extract_environment(job)
+        assert name == "my-env"
+        assert eid == "my-env"
+
+    def test_object_env_with_name_and_id(self):
+        env_obj = SimpleNamespace(name="env-name", id="env-id-123")
+        job = SimpleNamespace(environment=env_obj)
+        name, eid = _extract_environment(job)
+        assert name == "env-name"
+        assert eid == "env-id-123"
+
+    def test_object_env_with_name_only(self):
+        env_obj = SimpleNamespace(name="env-name")
+        job = SimpleNamespace(environment=env_obj)
+        name, eid = _extract_environment(job)
+        assert name == "env-name"
+        assert eid is None
+
+
+# ── _extract_creation_context ───────────────────────────────────────
+
+
+class TestExtractCreationContext:
+    def test_no_context(self):
+        job = SimpleNamespace()
+        result = _extract_creation_context(job)
+        assert result["created_at"] is None
+        assert result["created_by"] is None
+        assert len(result) == 6
+
+    def test_full_context(self):
+        ctx = SimpleNamespace(
+            created_at=datetime(2025, 1, 15, 10, 0, 0, tzinfo=timezone.utc),
+            created_by="user@example.com",
+            created_by_type="User",
+            last_modified_at=datetime(2025, 1, 15, 10, 5, 0, tzinfo=timezone.utc),
+            last_modified_by="admin@example.com",
+            last_modified_by_type="User",
+        )
+        job = SimpleNamespace(creation_context=ctx)
+        result = _extract_creation_context(job)
+        assert "2025-01-15" in result["created_at"]
+        assert result["created_by"] == "user@example.com"
+        assert result["last_modified_by"] == "admin@example.com"
+
+    def test_partial_context(self):
+        ctx = SimpleNamespace(
+            created_at=datetime(2025, 6, 1, tzinfo=timezone.utc),
+            created_by="a@b.com",
+        )
+        job = SimpleNamespace(creation_context=ctx)
+        result = _extract_creation_context(job)
+        assert result["created_by"] == "a@b.com"
+        # Missing attrs default to None via getattr
+        assert result["created_by_type"] is None
+
+
+# ── _resolve_timestamps ─────────────────────────────────────────────
+
+
+class TestResolveTimestamps:
+    def test_all_none(self):
+        start, end, dur = _resolve_timestamps(None, None, None)
+        assert start is None
+        assert end is None
+        assert dur is None
+
+    def test_mlflow_ms_preferred(self):
+        start, end, dur = _resolve_timestamps(
+            1736935200000, 1736935260000,
+            {"StartTimeUtc": "should-not-use", "EndTimeUtc": "should-not-use"},
+        )
+        assert start is not None
+        assert end is not None
+        assert dur == pytest.approx(60.0)
+
+    def test_fallback_to_properties(self):
+        start, end, dur = _resolve_timestamps(
+            None, None,
+            {"StartTimeUtc": "2025-01-15T10:00:00Z", "EndTimeUtc": "2025-01-15T10:02:00Z"},
+        )
+        assert start is not None
+        assert dur == pytest.approx(120.0)
+
+    def test_partial_mlflow(self):
+        """MLflow has start but not end; end falls back to properties."""
+        start, end, dur = _resolve_timestamps(
+            1736935200000, None,
+            {"EndTimeUtc": "2025-01-15T12:00:00+00:00"},
+        )
+        assert start is not None
+        assert end is not None
+
+
+# ── _fetch_mlflow_data ──────────────────────────────────────────────
+
+
+class TestFetchMlflowData:
+    def _make_mock_client(self, *, has_data=True, has_info=True, has_inputs=False):
+        client = MagicMock()
+        run = MagicMock()
+        if has_data:
+            run.data.metrics = {"acc": 0.9}
+            run.data.params = {"lr": "0.01"}
+            run.data.tags = {"mlflow.source.name": "train.py"}
+        else:
+            run.data = None
+        if has_info:
+            run.info.run_id = "run-123"
+            run.info.run_name = "happy_run"
+            run.info.experiment_id = "exp-1"
+            run.info.user_id = "user@example.com"
+            run.info.artifact_uri = "azureml://artifacts/run-123"
+            run.info.start_time = 1736935200000
+            run.info.end_time = 1736935260000
+        else:
+            run.info = None
+        if has_inputs:
+            run.inputs.dataset_inputs = [{"name": "ds1"}]
+        else:
+            # Remove inputs attr entirely
+            del run.inputs
+        client.get_run.return_value = run
+        return client
+
+    def test_full_data(self):
+        client = self._make_mock_client()
+        result = _fetch_mlflow_data(client, "job1")
+        assert isinstance(result, MlflowData)
+        assert result.metrics == {"acc": 0.9}
+        assert result.run_id == "run-123"
+        assert result.script_name == "train.py"
+        assert result.start_time_ms == 1736935200000
+
+    def test_no_data_section(self):
+        client = self._make_mock_client(has_data=False)
+        result = _fetch_mlflow_data(client, "job2")
+        assert result.metrics == {}
+        assert result.script_name is None
+
+    def test_resource_not_found(self):
+        client = MagicMock()
+        client.get_run.side_effect = MlflowException("RESOURCE_DOES_NOT_EXIST")
+        result = _fetch_mlflow_data(client, "missing_job")
+        assert result.metrics == {}
+        assert result.run_id is None
+
+    def test_unexpected_error(self):
+        client = MagicMock()
+        client.get_run.side_effect = RuntimeError("network failure")
+        result = _fetch_mlflow_data(client, "fail_job")
+        assert result.metrics == {}
+        assert result.run_id is None
+
+    def test_with_dataset_inputs(self):
+        client = self._make_mock_client(has_inputs=True)
+        result = _fetch_mlflow_data(client, "job_with_ds")
+        assert result.dataset_inputs is not None
