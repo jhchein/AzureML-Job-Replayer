@@ -1,13 +1,13 @@
-"""Phase 1 tests for pure functions in replayer.build_pipeline.
+"""Tests for pure functions in replayer.build_pipeline."""
 
-NOTE: build_pipeline.py calls setup_logging() at module scope (line 36-42).
-This is a known issue (P1 Phase 2 fix). The import triggers logging setup
-as a side effect but does not affect test correctness.
-"""
-
+import json
 
 from extractor.extract_jobs import JobMetadata
-from replayer.build_pipeline import _compute_depths, _index_jobs
+from replayer.build_pipeline import (
+    _compute_depths,
+    _create_disabled_manifest,
+    _index_jobs,
+)
 
 # ── helpers ─────────────────────────────────────────────────────────
 
@@ -117,3 +117,33 @@ class TestComputeDepths:
         # Both should have finite depths (cycle guard returns 0)
         assert isinstance(depths["a"], int)
         assert isinstance(depths["b"], int)
+
+
+# ── _create_disabled_manifest ───────────────────────────────────────
+
+
+class TestCreateDisabledManifest:
+    def test_returns_valid_json_file(self, tmp_path):
+        path = _create_disabled_manifest("job1")
+        assert path.endswith(".json")
+        with open(path) as f:
+            data = json.load(f)
+        assert data["disabled"] is True
+        assert data["original_run_id"] == "job1"
+
+    def test_schema_version_present(self, tmp_path):
+        path = _create_disabled_manifest("job2")
+        with open(path) as f:
+            data = json.load(f)
+        assert data["schema_version"] == 1
+
+    def test_relative_paths_empty(self, tmp_path):
+        path = _create_disabled_manifest("job3")
+        with open(path) as f:
+            data = json.load(f)
+        assert data["relative_paths"] == []
+
+    def test_unique_paths_per_call(self):
+        p1 = _create_disabled_manifest("same_job")
+        p2 = _create_disabled_manifest("same_job")
+        assert p1 != p2

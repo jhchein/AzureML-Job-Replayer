@@ -93,6 +93,25 @@ def _compute_depths(jobs_by_name: Dict[str, JobMetadata]) -> Dict[str, int]:
     return depth_cache
 
 
+def _create_disabled_manifest(run_id: str) -> str:
+    """Create a temporary JSON manifest that signals artifact copying is disabled.
+
+    Returns the path to the created temp file.
+    """
+    fd, path = tempfile.mkstemp(suffix=f"_{run_id}_manifest_disabled.json")
+    with os.fdopen(fd, "w", encoding="utf-8") as mf:
+        json.dump(
+            {
+                "schema_version": 1,
+                "disabled": True,
+                "original_run_id": run_id,
+                "relative_paths": [],
+            },
+            mf,
+        )
+    return path
+
+
 def build_dummy_pipeline_for_children(
     parent_job: JobMetadata,
     child_jobs: List[JobMetadata],
@@ -139,18 +158,7 @@ def build_dummy_pipeline_for_children(
         if manifest_paths:
             manifest_path = manifest_paths.get(step_job_meta.name)
         if not manifest_path:
-            # Create disabled manifest if absent
-            fd, manifest_path = tempfile.mkstemp(suffix="_disabled_manifest.json")
-            with os.fdopen(fd, "w", encoding="utf-8") as mf:
-                json.dump(
-                    {
-                        "schema_version": 1,
-                        "disabled": True,
-                        "original_run_id": step_job_meta.name,
-                        "relative_paths": [],
-                    },
-                    mf,
-                )
+            manifest_path = _create_disabled_manifest(step_job_meta.name)
 
         step_inputs = dict(
             original_job_id=step_job_meta.name,
@@ -219,17 +227,7 @@ def build_dummy_standalone_job(
     # Metrics file is already created by the caller
 
     if not artifact_manifest_path:
-        fd, artifact_manifest_path = tempfile.mkstemp(suffix="_disabled_manifest.json")
-        with os.fdopen(fd, "w", encoding="utf-8") as mf:
-            json.dump(
-                {
-                    "schema_version": 1,
-                    "disabled": True,
-                    "original_run_id": original_job.name,
-                    "relative_paths": [],
-                },
-                mf,
-            )
+        artifact_manifest_path = _create_disabled_manifest(original_job.name)
 
     inputs = dict(
         original_job_id=original_job.name,
@@ -413,20 +411,7 @@ def main(args):
         meta = JobMetadata(**jm)
         rel_paths = getattr(meta, "mlflow_artifact_paths", None) or []
         if not copy_artifacts:
-            fd, manifest_path = tempfile.mkstemp(
-                suffix=f"_{meta.name}_manifest_disabled.json"
-            )
-            with os.fdopen(fd, "w", encoding="utf-8") as mf:
-                json.dump(
-                    {
-                        "schema_version": 1,
-                        "disabled": True,
-                        "original_run_id": meta.name,
-                        "relative_paths": [],
-                    },
-                    mf,
-                )
-            manifests_by_job[meta.name] = manifest_path
+            manifests_by_job[meta.name] = _create_disabled_manifest(meta.name)
             continue
 
         if not source_account_name:
