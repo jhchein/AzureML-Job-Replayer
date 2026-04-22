@@ -36,5 +36,5 @@ replay_metrics_component = command(
         " --artifact-manifest ${{inputs.artifact_manifest}}"
         " --copy-artifacts"
     ),
-    environment=DUMMY_ENV,
+    environment=REGISTERED_ENV_ID,
 )

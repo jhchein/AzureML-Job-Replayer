@@ -630,6 +630,17 @@ def main(args):
             try:
                 env_reg = client.environments.create_or_update(DUMMY_ENV)
                 print(f" -> Environment '{env_reg.name}:{env_reg.version}' is ready.")
+            except HttpResponseError as e:
+                if "already registered" in str(e):
+                    print(
+                        f" -> Environment '{DUMMY_ENV.name}:{DUMMY_ENV.version}'"
+                        " already registered (unchanged)."
+                    )
+                else:
+                    logger.error("Error registering/updating dummy environment: %s", e)
+                    print(f"❌ Error registering/updating dummy environment: {e}")
+                    print("Cannot proceed without the registered environment. Exiting.")
+                    sys.exit(1)
             except Exception as e:
                 logger.error("Error registering/updating dummy environment: %s", e)
                 print(f"❌ Error registering/updating dummy environment: {e}")
