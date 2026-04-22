@@ -62,9 +62,11 @@ def log_metrics(
                     "Artifact copy requested but manifest could not be loaded inside replay step."
                 )
             if manifest.get("disabled"):
-                raise RuntimeError(
-                    "Artifact copy requested but manifest is disabled. Check replay logs for SAS generation errors."
+                print(
+                    "Artifact manifest is disabled — skipping artifact copy."
+                    " Metrics will still be logged."
                 )
+                perform_server_copy = False
         if manifest and not manifest.get("disabled") and perform_server_copy:
             print("Starting artifact download into local ./outputs ...")
             src_info = manifest.get("source", {})
