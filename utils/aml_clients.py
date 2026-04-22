@@ -26,6 +26,14 @@ def load_workspace_config(config_path: str) -> dict:
         return json.load(f)
 
 
+_AZ_CLI_TIMEOUT_SECONDS = 30
+"""Timeout for ``az account get-access-token`` subprocess calls.
+
+The default 10 s is too tight on cold starts / slow machines —
+9+ s is common, causing intermittent ``CredentialUnavailableError``.
+"""
+
+
 class AzureCliCredentialPool:
     """Thread-safe cache of AzureCliCredential instances keyed by tenant."""
 
@@ -39,9 +47,14 @@ class AzureCliCredentialPool:
             cred = self._cache.get(key)
             if cred is None:
                 cred = (
-                    AzureCliCredential(tenant_id=tenant_id)
+                    AzureCliCredential(
+                        tenant_id=tenant_id,
+                        process_timeout=_AZ_CLI_TIMEOUT_SECONDS,
+                    )
                     if tenant_id
-                    else AzureCliCredential()
+                    else AzureCliCredential(
+                        process_timeout=_AZ_CLI_TIMEOUT_SECONDS,
+                    )
                 )
                 self._cache[key] = cred
         return cred
