@@ -79,6 +79,7 @@ def setup_logging(log_filename_prefix="app"):
     logging.getLogger("urllib3").setLevel(logging.INFO)
     logging.getLogger("attr_dict").setLevel(logging.INFO)
     logging.getLogger("azure.core.pipeline.policies").setLevel(logging.WARNING)
+    logging.getLogger("azure.ai.ml").setLevel(logging.WARNING)
     logging.getLogger("azureml").setLevel(logging.INFO)
 
     # --- Final message (using print to stdout) ---

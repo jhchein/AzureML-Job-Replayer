@@ -20,13 +20,16 @@ This script only exports the YAML definition (MLTable file) plus a small manifes
 No data files are copied.
 """
 from __future__ import annotations
+
 import argparse
 import json
 from pathlib import Path
 from typing import Iterable
-from azure.identity import AzureCliCredential
+
 from azure.ai.ml import MLClient
 from azure.ai.ml.entities import Data
+from azure.identity import AzureCliCredential
+
 from .selection import SelectionSpec
 from .util_logging import log
 

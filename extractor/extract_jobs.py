@@ -2,15 +2,15 @@ import argparse
 import json
 import logging
 import os
+import random as _rand  # jitter for retries
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, Future
 from collections import deque
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from threading import Lock
 from typing import Any, Dict, List, Optional, Set, Tuple
-import random as _rand  # jitter for retries
 
 import mlflow
 from azure.ai.ml import MLClient
@@ -92,7 +92,12 @@ def safe_duration(start: Any, end: Any) -> Optional[float]:
             )
             return None
         logger.warning(
-            f"Could not parse start ({start}, type: {type(start)}) or end ({end}, type: {type(end)}) time for duration calculation."
+            "Could not parse start (%s, type: %s) or end (%s, type: %s)"
+            " time for duration calculation.",
+            start,
+            type(start),
+            end,
+            type(end),
         )
         return None
     except (ValueError, TypeError, OverflowError, date_parser.ParserError) as e:  # type: ignore[attr-defined]
@@ -238,118 +243,236 @@ class JobMetadata:
         return d
 
 
-def _process_job_object(job: Job, mlflow_client: MlflowClient) -> Optional[JobMetadata]:
-    if job.name is None:
-        logger.warning("Job object without a name encountered; skipping.")
-        return None
-    job_name: str = job.name
-    logger.info(f"Processing job object: {job_name} (Type: {job.type})")
+# ---------------------------------------------------------------------------
+# Phase 3: Helper dataclass & extraction functions for _process_job_object
+# ---------------------------------------------------------------------------
 
-    mlflow_metrics = {}
-    mlflow_params = {}
-    mlflow_tags_dict = {}
-    mlflow_dataset_inputs = None
-    mlflow_run_id = None
-    mlflow_run_name = None
-    mlflow_experiment_id = None
-    mlflow_user_id = None
-    mlflow_artifact_uri = None
-    mlflow_start_time_ms = None
-    mlflow_end_time_ms = None
-    script_name = None
 
+@dataclass
+class MlflowData:
+    """Container for data fetched from a single MLflow run."""
+
+    metrics: Dict[str, Any]
+    params: Dict[str, Any]
+    tags: Dict[str, Any]
+    dataset_inputs: Any
+    run_id: Optional[str]
+    run_name: Optional[str]
+    experiment_id: Optional[str]
+    user_id: Optional[str]
+    artifact_uri: Optional[str]
+    start_time_ms: Optional[int]
+    end_time_ms: Optional[int]
+    script_name: Optional[str]
+
+
+_EMPTY_MLFLOW_DATA = MlflowData(
+    metrics={},
+    params={},
+    tags={},
+    dataset_inputs=None,
+    run_id=None,
+    run_name=None,
+    experiment_id=None,
+    user_id=None,
+    artifact_uri=None,
+    start_time_ms=None,
+    end_time_ms=None,
+    script_name=None,
+)
+
+
+def _fetch_mlflow_data(mlflow_client: MlflowClient, job_name: str) -> MlflowData:
+    """Fetch metrics, params, tags, and run info from MLflow for a job.
+
+    Returns an MlflowData with empty defaults if the run is not found.
+    """
     try:
         mlflow_run = mlflow_client.get_run(job_name)
-        if mlflow_run and mlflow_run.data:
-            mlflow_metrics = mlflow_run.data.metrics or {}
-            mlflow_params = mlflow_run.data.params or {}
-            mlflow_tags_dict = mlflow_run.data.tags or {}
-            script_name = mlflow_tags_dict.get("mlflow.source.name")
-            logger.info(
-                f"Retrieved {len(mlflow_metrics)} metrics, {len(mlflow_params)} params for MLflow run {job_name}"
-            )
-        if mlflow_run and mlflow_run.info:
-            mlflow_run_id = mlflow_run.info.run_id
-            mlflow_run_name = mlflow_run.info.run_name
-            mlflow_experiment_id = mlflow_run.info.experiment_id
-            mlflow_user_id = mlflow_run.info.user_id
-            mlflow_artifact_uri = mlflow_run.info.artifact_uri
-            mlflow_start_time_ms = mlflow_run.info.start_time
-            mlflow_end_time_ms = mlflow_run.info.end_time
-        if (
-            mlflow_run
-            and hasattr(mlflow_run, "inputs")
-            and hasattr(mlflow_run.inputs, "dataset_inputs")
-        ):
-            mlflow_dataset_inputs = convert_complex_dict(
-                mlflow_run.inputs.dataset_inputs
-            )
-    except MlflowException as e:  # noqa: BLE001
+    except MlflowException as e:
         if "RESOURCE_DOES_NOT_EXIST" in str(e) or (
             "Run with id=" in str(e) and "not found" in str(e)
         ):
             logger.info(
-                f"No MLflow run found for job {job_name}. This might be expected."
+                "No MLflow run found for job %s. This might be expected.", job_name
             )
         else:
-            logger.warning(f"MLflow Error retrieving run for job {job_name}: {e}")
+            logger.warning("MLflow Error retrieving run for job %s: %s", job_name, e)
+        return MlflowData(
+            **{
+                f.name: getattr(_EMPTY_MLFLOW_DATA, f.name)
+                for f in fields(_EMPTY_MLFLOW_DATA)
+            }
+        )
     except Exception as e:  # noqa: BLE001
         logger.warning(
-            f"Unexpected Error retrieving MLflow run for job {job_name}: {e}"
+            "Unexpected Error retrieving MLflow run for job %s: %s", job_name, e
+        )
+        return MlflowData(
+            **{
+                f.name: getattr(_EMPTY_MLFLOW_DATA, f.name)
+                for f in fields(_EMPTY_MLFLOW_DATA)
+            }
         )
 
-    job_id = getattr(job, "id", None)
-    display_name = getattr(job, "display_name", job.name)
-    job_type = getattr(job, "type", None)
-    status = getattr(job, "status", None)
-    experiment_name = getattr(job, "experiment_name", None)
-    parent_job_name = getattr(job, "parent_job_name", None)
-    description = getattr(job, "description", None)
-    tags = getattr(job, "tags", {})
-    command = getattr(job, "command", None)
-    job_parameters = getattr(job, "parameters", None)
-    environment_variables = getattr(job, "environment_variables", None)
-    code_obj = getattr(job, "code", None)
-    code_id = str(code_obj) if code_obj else None
-    compute_target_name = getattr(job, "compute", None)
-    job_inputs = getattr(job, "inputs", None)
-    job_outputs = getattr(job, "outputs", None)
-    identity_obj = getattr(job, "identity", None)
-    identity_type = getattr(identity_obj, "type", None) if identity_obj else None
-    services = getattr(job, "services", None)
-    job_properties = getattr(job, "properties", None)
+    metrics: Dict[str, Any] = {}
+    params: Dict[str, Any] = {}
+    tags_dict: Dict[str, Any] = {}
+    dataset_inputs = None
+    run_id = None
+    run_name = None
+    experiment_id = None
+    user_id = None
+    artifact_uri = None
+    start_time_ms = None
+    end_time_ms = None
+    script_name = None
 
-    distribution = getattr(job, "distribution", None)
-    job_limits = getattr(job, "limits", None)
-    task_details = getattr(job, "task_details", None)
-    objective = getattr(job, "objective", None)
-    search_space = getattr(job, "search_space", None)
-    sampling_algorithm = getattr(job, "sampling_algorithm", None)
-    early_termination = getattr(job, "early_termination", None)
-    trial_component = getattr(job, "trial", None)
-    pipeline_settings = getattr(job, "settings", None)
-    pipeline_sub_jobs = getattr(job, "jobs", None)
+    if mlflow_run and mlflow_run.data:
+        metrics = mlflow_run.data.metrics or {}
+        params = mlflow_run.data.params or {}
+        tags_dict = mlflow_run.data.tags or {}
+        script_name = tags_dict.get("mlflow.source.name")
+        logger.info(
+            "Retrieved %d metrics, %d params for MLflow run %s",
+            len(metrics),
+            len(params),
+            job_name,
+        )
+    if mlflow_run and mlflow_run.info:
+        run_id = mlflow_run.info.run_id
+        run_name = mlflow_run.info.run_name
+        experiment_id = mlflow_run.info.experiment_id
+        user_id = mlflow_run.info.user_id
+        artifact_uri = mlflow_run.info.artifact_uri
+        start_time_ms = mlflow_run.info.start_time
+        end_time_ms = mlflow_run.info.end_time
+    if (
+        mlflow_run
+        and hasattr(mlflow_run, "inputs")
+        and hasattr(mlflow_run.inputs, "dataset_inputs")
+    ):
+        dataset_inputs = convert_complex_dict(mlflow_run.inputs.dataset_inputs)
 
-    environment_name = None
-    environment_id = None
+    return MlflowData(
+        metrics=metrics,
+        params=params,
+        tags=tags_dict,
+        dataset_inputs=dataset_inputs,
+        run_id=run_id,
+        run_name=run_name,
+        experiment_id=experiment_id,
+        user_id=user_id,
+        artifact_uri=artifact_uri,
+        start_time_ms=start_time_ms,
+        end_time_ms=end_time_ms,
+        script_name=script_name,
+    )
+
+
+def _extract_environment(job: Job) -> Tuple[Optional[str], Optional[str]]:
+    """Extract environment_name and environment_id from a Job object.
+
+    Returns (environment_name, environment_id).
+    """
     environment_obj = getattr(job, "environment", None)
-    if environment_obj:
-        if isinstance(environment_obj, str):
-            environment_id = environment_obj
-            parts = environment_obj.split("/")
-            name_part = parts[-1]
-            if ":" in name_part and "@" in name_part:
-                environment_name = name_part.split("@")[0]
-            elif ":" in name_part:
-                environment_name = name_part
-            else:
-                environment_name = name_part
-        elif hasattr(environment_obj, "name"):
-            environment_name = environment_obj.name
-            if hasattr(environment_obj, "id"):
-                environment_id = environment_obj.id
-            elif isinstance(environment_obj, str):
-                environment_id = str(environment_obj)
+    if not environment_obj:
+        return None, None
+
+    if isinstance(environment_obj, str):
+        environment_id = environment_obj
+        parts = environment_obj.split("/")
+        name_part = parts[-1]
+        if ":" in name_part and "@" in name_part:
+            environment_name = name_part.split("@")[0]
+        elif ":" in name_part:
+            environment_name = name_part
+        else:
+            environment_name = name_part
+        return environment_name, environment_id
+
+    # Object with .name / .id attributes
+    environment_name = getattr(environment_obj, "name", None)
+    environment_id = getattr(environment_obj, "id", None)
+    if environment_id is None and isinstance(environment_obj, str):
+        environment_id = str(environment_obj)
+    return environment_name, environment_id
+
+
+def _extract_creation_context(job: Job) -> Dict[str, Optional[str]]:
+    """Extract creation context fields from a Job object.
+
+    Returns dict with keys: created_at, created_by, created_by_type,
+    last_modified_at, last_modified_by, last_modified_by_type.
+    """
+    ctx = getattr(job, "creation_context", None)
+    if ctx is None:
+        return {
+            "created_at": None,
+            "created_by": None,
+            "created_by_type": None,
+            "last_modified_at": None,
+            "last_modified_by": None,
+            "last_modified_by_type": None,
+        }
+    return {
+        "created_at": safe_isoformat(getattr(ctx, "created_at", None)),
+        "created_by": getattr(ctx, "created_by", None),
+        "created_by_type": getattr(ctx, "created_by_type", None),
+        "last_modified_at": safe_isoformat(getattr(ctx, "last_modified_at", None)),
+        "last_modified_by": getattr(ctx, "last_modified_by", None),
+        "last_modified_by_type": getattr(ctx, "last_modified_by_type", None),
+    }
+
+
+def _resolve_timestamps(
+    mlflow_start_ms: Optional[int],
+    mlflow_end_ms: Optional[int],
+    job_properties: Optional[Dict[str, Any]],
+) -> Tuple[Optional[str], Optional[str], Optional[float]]:
+    """Resolve start_time, end_time, and duration_seconds.
+
+    Prefers MLflow ms timestamps; falls back to job_properties StartTimeUtc/EndTimeUtc.
+    Returns (start_time_iso, end_time_iso, duration_seconds).
+    """
+    prop_start = job_properties.get("StartTimeUtc") if job_properties else None
+    prop_end = job_properties.get("EndTimeUtc") if job_properties else None
+    start_raw = mlflow_start_ms if mlflow_start_ms is not None else prop_start
+    end_raw = mlflow_end_ms if mlflow_end_ms is not None else prop_end
+    return (
+        safe_isoformat(start_raw),
+        safe_isoformat(end_raw),
+        safe_duration(start_raw, end_raw),
+    )
+
+
+def _process_job_object(job: Job, mlflow_client: MlflowClient) -> Optional[JobMetadata]:
+    """Extract metadata from a single Job + its MLflow run into a JobMetadata."""
+    if job.name is None:
+        logger.warning("Job object without a name encountered; skipping.")
+        return None
+    job_name: str = job.name
+    logger.info("Processing job object: %s (Type: %s)", job_name, job.type)
+
+    # --- MLflow data ---
+    mf = _fetch_mlflow_data(mlflow_client, job_name)
+
+    # --- Job attributes (getattr-safe) ---
+    job_properties = getattr(job, "properties", None)
+    code_obj = getattr(job, "code", None)
+    identity_obj = getattr(job, "identity", None)
+    resources_obj = (
+        getattr(job, "resources", None) if hasattr(job, "resources") else None
+    )
+
+    # --- Derived fields ---
+    environment_name, environment_id = _extract_environment(job)
+    ctx = _extract_creation_context(job)
+    start_time, end_time, duration_seconds = _resolve_timestamps(
+        mf.start_time_ms,
+        mf.end_time_ms,
+        job_properties,
+    )
 
     compute_id_from_props = None
     compute_type = None
@@ -359,112 +482,66 @@ def _process_job_object(job: Job, mlflow_client: MlflowClient) -> Optional[JobMe
 
     instance_count = None
     instance_type = None
-    resources_obj = (
-        getattr(job, "resources", None) if hasattr(job, "resources") else None
-    )
     if resources_obj is not None:
         instance_count = getattr(resources_obj, "instance_count", None)
         instance_type = getattr(resources_obj, "instance_type", None)
 
-    created_at_dt = (
-        getattr(job.creation_context, "created_at", None)
-        if hasattr(job, "creation_context")
-        else None
-    )
-    created_at = safe_isoformat(created_at_dt)
-    created_by = (
-        getattr(job.creation_context, "created_by", None)
-        if hasattr(job, "creation_context")
-        else None
-    )
-    created_by_type = (
-        getattr(job.creation_context, "created_by_type", None)
-        if hasattr(job, "creation_context")
-        else None
-    )
-    last_modified_at_dt = (
-        getattr(job.creation_context, "last_modified_at", None)
-        if hasattr(job, "creation_context")
-        else None
-    )
-    last_modified_at = safe_isoformat(last_modified_at_dt)
-    last_modified_by = (
-        getattr(job.creation_context, "last_modified_by", None)
-        if hasattr(job, "creation_context")
-        else None
-    )
-    last_modified_by_type = (
-        getattr(job.creation_context, "last_modified_by_type", None)
-        if hasattr(job, "creation_context")
-        else None
-    )
-
-    prop_start = job_properties.get("StartTimeUtc") if job_properties else None
-    prop_end = job_properties.get("EndTimeUtc") if job_properties else None
-    start_time_raw = (
-        mlflow_start_time_ms if mlflow_start_time_ms is not None else prop_start
-    )
-    end_time_raw = mlflow_end_time_ms if mlflow_end_time_ms is not None else prop_end
-    start_time = safe_isoformat(start_time_raw)
-    end_time = safe_isoformat(end_time_raw)
-    duration_seconds = safe_duration(start_time_raw, end_time_raw)
-
     jm = JobMetadata(
         name=job_name,
-        id=job_id,
-        display_name=display_name,
-        job_type=job_type,
-        status=status,
-        experiment_name=experiment_name,
-        parent_job_name=parent_job_name,
-        created_at=created_at,
+        id=getattr(job, "id", None),
+        display_name=getattr(job, "display_name", job.name),
+        job_type=getattr(job, "type", None),
+        status=getattr(job, "status", None),
+        experiment_name=getattr(job, "experiment_name", None),
+        parent_job_name=getattr(job, "parent_job_name", None),
+        created_at=ctx["created_at"],
         start_time=start_time,
         end_time=end_time,
         duration_seconds=duration_seconds,
-        created_by=created_by,
-        created_by_type=created_by_type,
-        last_modified_at=last_modified_at,
-        last_modified_by=last_modified_by,
-        last_modified_by_type=last_modified_by_type,
-        command=command,
-        script_name=script_name,
+        created_by=ctx["created_by"],
+        created_by_type=ctx["created_by_type"],
+        last_modified_at=ctx["last_modified_at"],
+        last_modified_by=ctx["last_modified_by"],
+        last_modified_by_type=ctx["last_modified_by_type"],
+        command=getattr(job, "command", None),
+        script_name=mf.script_name,
         environment_name=environment_name,
         environment_id=environment_id,
-        environment_variables=environment_variables,
-        code_id=code_id,
+        environment_variables=getattr(job, "environment_variables", None),
+        code_id=str(code_obj) if code_obj else None,
         arguments=None,
-        job_parameters=job_parameters,
-        compute_target=compute_target_name,
+        job_parameters=getattr(job, "parameters", None),
+        compute_target=getattr(job, "compute", None),
         compute_id=compute_id_from_props,
         compute_type=compute_type,
         instance_count=instance_count,
         instance_type=instance_type,
-        distribution=distribution,
-        job_limits=job_limits,
-        job_inputs=job_inputs,
-        job_outputs=job_outputs,
-        identity_type=identity_type,
-        services=services,
+        distribution=getattr(job, "distribution", None),
+        job_limits=getattr(job, "limits", None),
+        job_inputs=getattr(job, "inputs", None),
+        job_outputs=getattr(job, "outputs", None),
+        identity_type=getattr(identity_obj, "type", None) if identity_obj else None,
+        services=getattr(job, "services", None),
         job_properties=job_properties,
-        task_details=task_details,
-        objective=objective,
-        search_space=search_space,
-        sampling_algorithm=sampling_algorithm,
-        early_termination=early_termination,
-        trial_component=trial_component,
-        pipeline_settings=pipeline_settings,
-        pipeline_sub_jobs=pipeline_sub_jobs,
-        description=description,
-        tags=tags,
-        mlflow_run_id=mlflow_run_id,
-        mlflow_run_name=mlflow_run_name,
-        mlflow_experiment_id=mlflow_experiment_id,
-        mlflow_user_id=mlflow_user_id,
-        mlflow_artifact_uri=mlflow_artifact_uri,
-        mlflow_metrics=mlflow_metrics,
-        mlflow_params=mlflow_params,
-        mlflow_tags=mlflow_tags_dict,
-        mlflow_dataset_inputs=mlflow_dataset_inputs,
+        task_details=getattr(job, "task_details", None),
+        objective=getattr(job, "objective", None),
+        search_space=getattr(job, "search_space", None),
+        sampling_algorithm=getattr(job, "sampling_algorithm", None),
+        early_termination=getattr(job, "early_termination", None),
+        trial_component=getattr(job, "trial", None),
+        pipeline_settings=getattr(job, "settings", None),
+        pipeline_sub_jobs=getattr(job, "jobs", None),
+        description=getattr(job, "description", None),
+        tags=getattr(job, "tags", {}),
+        mlflow_run_id=mf.run_id,
+        mlflow_run_name=mf.run_name,
+        mlflow_experiment_id=mf.experiment_id,
+        mlflow_user_id=mf.user_id,
+        mlflow_artifact_uri=mf.artifact_uri,
+        mlflow_metrics=mf.metrics,
+        mlflow_params=mf.params,
+        mlflow_tags=mf.tags,
+        mlflow_dataset_inputs=mf.dataset_inputs,
     )
     return jm
 
@@ -763,11 +840,15 @@ def main(
         missing_requested = missing_requested_list
         if missing_requested:
             logger.warning(
-                f"{len(missing_requested)} requested top-level job name(s) not found and were skipped: {missing_requested}"
+                "%d requested top-level job name(s) not found and were skipped: %s",
+                len(missing_requested),
+                missing_requested,
             )
 
     print(
-        f"\nSuccessfully extracted {job_count} total jobs (including descendants) to {output_path} in {elapsed:.2f}s (parallel={parallel})"
+        f"\nSuccessfully extracted {job_count} total jobs"
+        f" (including descendants) to {output_path}"
+        f" in {elapsed:.2f}s (parallel={parallel})"
     )
 
 
@@ -793,6 +874,7 @@ def _parse_include_args(args) -> Optional[Set[str]]:
                     if name:
                         include_names.add(name)
         except OSError as e:
+            logger.warning("Failed to read include file '%s': %s", args.include_file, e)
             print(f"WARNING: Failed to read include file '{args.include_file}': {e}")
     if not include_names:
         return None

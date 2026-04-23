@@ -10,33 +10,35 @@ Usage:
      --source-dir exported_mltables --on-exists skip
 """
 from __future__ import annotations
+
 import argparse
 import json
 import re
 import time
-from datetime import datetime, timedelta, timezone
-from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Optional, Tuple
+from urllib.parse import urlparse
 
-from azure.identity import AzureCliCredential
 from azure.ai.ml import MLClient
 from azure.ai.ml.entities import Data
+from azure.identity import AzureCliCredential
 from azure.storage.blob import (
     BlobSasPermissions,
     BlobServiceClient,
     generate_blob_sas,
 )
 
-from .util_logging import log
-from .selection import SelectionSpec, WorkspaceRef
 from utils.aml_clients import (
     AzureCliCredentialPool,
     create_ml_client,
     get_cli_credential,
 )
+
+from .selection import SelectionSpec, WorkspaceRef
+from .util_logging import log
 
 
 def parse_args():

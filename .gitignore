@@ -176,9 +176,19 @@ cython_debug/
 config/*.json
 data/*.json
 logs/*.log
+
 .vscode/
 *.txt
-todos.md
+
+# Sensitive / local data
 data/*
 artifacts_export/*
-*instructions.md
+mltables.yaml
+
+# Project spec MUST NEVER BE COMMITTED TO GIT!!! FFS
+project-spec/ 
+
+# Github copilot configuration file MUST NEVER BE COMMITTED TO GIT!!! FFS
+.github/*md
+.github/prompts/*
+.github/instructions/*

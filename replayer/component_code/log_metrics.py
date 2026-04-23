@@ -1,11 +1,12 @@
 import argparse
 import json
 import os
-import mlflow
 import shutil
 import time
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+import mlflow
 from azure.storage.blob import BlobClient, ContainerClient
 
 
@@ -61,9 +62,11 @@ def log_metrics(
                     "Artifact copy requested but manifest could not be loaded inside replay step."
                 )
             if manifest.get("disabled"):
-                raise RuntimeError(
-                    "Artifact copy requested but manifest is disabled. Check replay logs for SAS generation errors."
+                print(
+                    "Artifact manifest is disabled — skipping artifact copy."
+                    " Metrics will still be logged."
                 )
+                perform_server_copy = False
         if manifest and not manifest.get("disabled") and perform_server_copy:
             print("Starting artifact download into local ./outputs ...")
             src_info = manifest.get("source", {})
@@ -216,7 +219,9 @@ def log_metrics(
 
                 elapsed = time.time() - start_time
                 print(
-                    f"Artifact download summary: total={len(work_items)} success={success} failed={len(failures)} bytes={total_bytes} time_sec={elapsed:.2f}"
+                    f"Artifact download summary: total={len(work_items)}"
+                    f" success={success} failed={len(failures)}"
+                    f" bytes={total_bytes} time_sec={elapsed:.2f}"
                 )
                 if failures:
                     print("First failure:", failures[0])
