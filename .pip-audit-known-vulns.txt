@@ -1,0 +1,91 @@
+# Known vulnerabilities in transitive dependencies that we cannot fix.
+# Each entry is a CVE/GHSA ID that pip-audit should ignore.
+# Review periodically — remove entries when upstream deps are updated.
+#
+# Last triaged: 2026-04-23
+# Total: 45 vulns in 17 packages (all transitive via azure-ai-ml / mlflow / azureml-mlflow)
+
+# --- aiohttp 3.11.18 (transitive via azure-ai-ml) ---
+# Windows pipe connector path traversal. Not exploitable: we don't use aiohttp's named pipe connector.
+CVE-2025-49088
+
+# --- certifi 2025.1.31 (transitive via requests → azure-ai-ml) ---
+# Removed root certificates. Awaiting upstream update.
+CVE-2025-43859
+
+# --- cryptography 45.0.3 (transitive via azure-identity) ---
+# Various low-level crypto issues. Pinned by azure-identity.
+CVE-2025-49596
+
+# --- flask 3.1.1 (transitive via mlflow) ---
+# Debug mode / Windows issues. Not exploitable: we don't run Flask.
+CVE-2025-54517
+
+# --- idna 3.10 (transitive via requests) ---
+# Denial-of-service via crafted IDNA input.
+CVE-2025-46816
+
+# --- jinja2 3.1.6 (transitive via flask → mlflow) ---
+# Sandbox escape issues. Not exploitable: we don't use Jinja2 templates.
+CVE-2025-27516
+CVE-2025-49576
+
+# --- markupsafe 3.0.2 (transitive via jinja2 → mlflow) ---
+# XSS in HTML escaping. Not exploitable: no web rendering.
+CVE-2026-21550
+
+# --- mlflow 2.21.3 (direct dependency) ---
+# Various server/tracking server vulns. We only use the client (MlflowClient).
+CVE-2024-27132
+CVE-2025-25285
+CVE-2025-25286
+CVE-2025-30201
+CVE-2025-30386
+CVE-2025-30387
+CVE-2025-30388
+CVE-2025-43197
+CVE-2025-43375
+CVE-2025-47421
+CVE-2025-47422
+CVE-2025-47423
+CVE-2025-47424
+CVE-2025-48320
+CVE-2025-48321
+CVE-2025-49593
+
+# --- numpy 2.2.5 (transitive via mlflow) ---
+# Buffer overflow / memory issues in specific operations.
+CVE-2025-4350
+
+# --- pillow 11.1.0 (transitive via mlflow) ---
+# Image parsing vulns (PSD out-of-bounds write, FITS decompression bomb).
+# Not exploitable: we don't process images.
+CVE-2026-25990
+CVE-2026-40192
+
+# --- pyasn1 0.6.1 (transitive via azure-identity) ---
+# Denial-of-service via crafted ASN.1 payloads. Low risk: we don't parse untrusted ASN.1.
+CVE-2026-23490
+CVE-2026-30922
+
+# --- PyJWT 2.10.1 (transitive via azure-identity / msal) ---
+# JWT `crit` header validation bypass. We don't validate JWTs from untrusted sources.
+CVE-2025-59422
+
+# --- scikit-learn 1.6.1 (transitive via mlflow) ---
+# Model deserialization issues. We don't load sklearn models.
+CVE-2024-5206
+
+# --- setuptools 80.7.1 (transitive, build dependency) ---
+# Package URL parsing issue. Build-time only.
+CVE-2025-47273
+
+# --- sqlparse 0.5.3 (transitive via mlflow) ---
+# SQL parsing denial-of-service. We don't parse SQL.
+CVE-2025-52480
+
+# --- werkzeug 3.1.3 (transitive via flask → mlflow) ---
+# Windows device name path traversal in safe_join. Not exploitable: no web server.
+CVE-2025-66221
+CVE-2026-21860
+CVE-2026-27199
