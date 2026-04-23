@@ -1,6 +1,9 @@
 """Tests for pure functions in replayer.build_pipeline."""
 
 import json
+from unittest.mock import MagicMock
+
+from azure.core.exceptions import ResourceNotFoundError
 
 from extractor.extract_jobs import JobMetadata
 from replayer.build_pipeline import (
@@ -10,6 +13,7 @@ from replayer.build_pipeline import (
     _index_jobs,
     _infer_parent_links,
     _load_manifest,
+    _resolve_source_container,
 )
 
 # ── helpers ─────────────────────────────────────────────────────────
@@ -348,3 +352,101 @@ class TestClassifyReplayUnits:
         # child_step_001 is NOT a standalone root
         assert ("standalone", "child_step_001") not in replay_units
         assert "child_step_001" in children["pipeline_parent_001"]
+
+
+# ── _resolve_source_container ───────────────────────────────────────
+
+
+class TestResolveSourceContainer:
+    def _mock_blob_service(self, containers_with_blobs: dict[str, bool]):
+        """Create a mock BlobServiceClient that returns blobs (or not) per container.
+
+        containers_with_blobs: {"azureml-blobstore-xxx": True, "azureml": False}
+        means the first container has blobs, the second doesn't.
+        """
+        svc = MagicMock()
+
+        def _get_container_client(name):
+            cc = MagicMock()
+            if name not in containers_with_blobs:
+                cc.list_blobs.side_effect = ResourceNotFoundError("ContainerNotFound")
+            elif containers_with_blobs[name]:
+                cc.list_blobs.return_value = iter([MagicMock()])  # one blob
+            else:
+                cc.list_blobs.return_value = iter([])  # empty
+            return cc
+
+        svc.get_container_client.side_effect = _get_container_client
+        return svc
+
+    def test_found_in_datastore_container(self):
+        """Blobs exist in the datastore container — use it directly."""
+        svc = self._mock_blob_service({"azureml-blobstore-xxx": True})
+        result = _resolve_source_container(
+            svc, "azureml-blobstore-xxx", ["job1", "job2"]
+        )
+        assert result == "azureml-blobstore-xxx"
+
+    def test_fallback_to_azureml(self):
+        """No blobs in datastore container, found in 'azureml' fallback."""
+        svc = self._mock_blob_service(
+            {"azureml-blobstore-xxx": False, "azureml": True}
+        )
+        result = _resolve_source_container(
+            svc, "azureml-blobstore-xxx", ["job1", "job2"]
+        )
+        assert result == "azureml"
+
+    def test_fallback_container_not_found(self):
+        """Datastore container empty, fallback container doesn't exist — raises."""
+        svc = self._mock_blob_service({"azureml-blobstore-xxx": False})
+        import pytest
+
+        with pytest.raises(RuntimeError, match="Could not find"):
+            _resolve_source_container(
+                svc, "azureml-blobstore-xxx", ["job1"]
+            )
+
+    def test_both_empty_raises(self):
+        """Both containers exist but have no blobs — raises."""
+        svc = self._mock_blob_service(
+            {"azureml-blobstore-xxx": False, "azureml": False}
+        )
+        import pytest
+
+        with pytest.raises(RuntimeError, match="Could not find"):
+            _resolve_source_container(
+                svc, "azureml-blobstore-xxx", ["job1"]
+            )
+
+    def test_probes_multiple_jobs(self):
+        """First job has no blobs, second job does — still finds container."""
+        svc = MagicMock()
+        call_count = {"n": 0}
+
+        def _get_cc(name):
+            cc = MagicMock()
+
+            def _list_blobs(**kwargs):
+                prefix = kwargs.get("name_starts_with", "")
+                call_count["n"] += 1
+                if "job1" in prefix:
+                    return iter([])
+                return iter([MagicMock()])
+
+            cc.list_blobs.side_effect = _list_blobs
+            return cc
+
+        svc.get_container_client.side_effect = _get_cc
+        result = _resolve_source_container(
+            svc, "azureml-blobstore-xxx", ["job1", "job2"]
+        )
+        assert result == "azureml-blobstore-xxx"
+
+    def test_skips_fallback_when_same_as_datastore(self):
+        """If datastore container IS 'azureml', don't probe it twice."""
+        svc = self._mock_blob_service({"azureml": False})
+        import pytest
+
+        with pytest.raises(RuntimeError, match="Could not find"):
+            _resolve_source_container(svc, "azureml", ["job1"])

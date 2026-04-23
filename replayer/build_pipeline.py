@@ -18,7 +18,7 @@ from azure.ai.ml.entities import (
     PipelineJobSettings,
     UserIdentityConfiguration,
 )
-from azure.core.exceptions import HttpResponseError
+from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
 from azure.identity import AzureCliCredential
 from azure.storage.blob import (
     BlobServiceClient,
@@ -219,6 +219,55 @@ def _classify_replay_units(
         ("standalone", n) for n in standalone_root_commands
     ]
     return replay_units, pipeline_depths, pipeline_children
+
+
+_FALLBACK_CONTAINER = "azureml"
+"""Legacy container name used by v1-era AzureML workspaces."""
+
+
+def _resolve_source_container(
+    blob_service: BlobServiceClient,
+    datastore_container: str,
+    job_names: List[str],
+    *,
+    fallback_container: str = _FALLBACK_CONTAINER,
+    max_probes: int = 3,
+) -> str:
+    """Probe which container holds job artifacts.
+
+    Checks up to *max_probes* jobs in *datastore_container* first, then
+    falls back to the legacy ``azureml`` container.  Returns the container
+    name that has blobs, or raises ``RuntimeError``.
+    """
+    candidates = [datastore_container]
+    if fallback_container != datastore_container:
+        candidates.append(fallback_container)
+
+    probe_jobs = job_names[:max_probes]
+    for container in candidates:
+        try:
+            cc = blob_service.get_container_client(container)
+            for name in probe_jobs:
+                prefix = f"ExperimentRun/dcid.{name}"
+                blobs = list(cc.list_blobs(name_starts_with=prefix, results_per_page=1))
+                if blobs:
+                    if container != datastore_container:
+                        logger.warning(
+                            "Artifacts found in legacy container '%s' instead of "
+                            "datastore container '%s'.",
+                            container,
+                            datastore_container,
+                        )
+                    return container
+        except ResourceNotFoundError:
+            logger.info("Container '%s' does not exist — skipping.", container)
+            continue
+
+    raise RuntimeError(
+        f"Could not find job artifacts in container '{datastore_container}'"
+        f" or fallback '{fallback_container}'. Verify the source workspace "
+        "storage account and container names."
+    )
 
 
 def build_dummy_pipeline_for_children(
@@ -465,6 +514,21 @@ def main(args):
                 f"https://{target_account_name}.blob.core.windows.net",
                 credential=target_credential,
             )
+
+            # Resolve source container (v1 workspaces may use "azureml" instead)
+            if getattr(args, "source_container", None):
+                source_container_name = args.source_container
+                print(f"Using explicit source container: {source_container_name}")
+            else:
+                job_names_for_probe = [jm.name for jm in all_jobs_metadata if jm.mlflow_artifact_paths]
+                if job_names_for_probe:
+                    source_container_name = _resolve_source_container(
+                        src_blob_service,
+                        source_container_name,
+                        job_names_for_probe,
+                    )
+                    print(f"Resolved source container: {source_container_name}")
+
             # Build SAS: source read, target write
             source_sas = build_container_sas(
                 src_blob_service, source_container_name, hours=6
@@ -937,6 +1001,15 @@ if __name__ == "__main__":
         action="store_true",
         default=False,
         help="Disable artifact copying (overrides --copy-artifacts default).",
+    )
+    parser.add_argument(
+        "--source-container",
+        type=str,
+        default=None,
+        help=(
+            "Override the source blob container name instead of auto-detecting. "
+            "Use when the workspace has a non-standard container (e.g., v1 'azureml')."
+        ),
     )
 
     args = parser.parse_args()
