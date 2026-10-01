@@ -6,13 +6,13 @@ from azure.ai.ml.entities import Environment
 # Assuming conda.yaml is correctly located relative to the project root
 # when running with 'python -m'
 DUMMY_ENV_NAME = "dummy-env"
-DUMMY_ENV_VERSION = "1.2.0"
+DUMMY_ENV_VERSION = "1.3.0"
 DUMMY_ENV_CONDA_PATH = "replayer/conda.yaml"  # Path relative to project root
 
 DUMMY_ENV = Environment(
     name=DUMMY_ENV_NAME,
     version=DUMMY_ENV_VERSION,
-    image="mcr.microsoft.com/azureml/openmpi4.1.0-ubuntu20.04:latest",
+    image="mcr.microsoft.com/azureml/openmpi4.1.0-ubuntu20.04@sha256:74a79815972fc52df633e894463c51ba80b178d039a7fc50c2072930b298fc33",
     conda_file=DUMMY_ENV_CONDA_PATH,
     description="Lightweight environment for replaying metrics.",
 )

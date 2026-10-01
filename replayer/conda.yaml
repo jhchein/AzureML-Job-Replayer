@@ -1,10 +1,9 @@
 name: dummy-env
 channels:
-  - defaults
   - conda-forge
 dependencies:
   - python=3.9
   - pip:
-    - mlflow
-    - azureml-mlflow
-    - azure-storage-blob
+    - mlflow==3.1.4
+    - azureml-mlflow==1.62.0.post6
+    - azure-storage-blob==12.30.3
