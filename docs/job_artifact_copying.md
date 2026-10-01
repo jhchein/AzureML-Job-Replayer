@@ -88,11 +88,6 @@ Each job gets an artifact manifest file with:
     "prefix": "ExperimentRun/dcid.job_name",
     "sas": "source_read_sas_token"
   },
-  "target": {
-    "account": "target_storage_account",
-    "container": "azureml",
-    "sas": "target_write_sas_token"
-  },
   "relative_paths": ["outputs/", "system_logs/", "logs/", "user_logs/"],
   "normalized_relative_paths": [
     "outputs/",

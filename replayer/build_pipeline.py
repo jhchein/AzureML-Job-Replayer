@@ -474,45 +474,24 @@ def main(args):
 
     manifests_by_job: Dict[str, str] = {}
     source_account_name = None
-    target_account_name = None
     source_container_name = None
-    target_container_name = None
     source_sas = None
-    target_sas = None
     if copy_artifacts and args.source:
         try:
-            # TODO: Add tenant_id support!
             source_client = get_ml_client(args.source)
             source_datastore = source_client.datastores.get("workspaceblobstore")
-            target_client_for_manifest = get_ml_client(args.target)
-            target_datastore = target_client_for_manifest.datastores.get(
-                "workspaceblobstore"
-            )
-
             src_config = load_workspace_config(args.source)
-            target_config = load_workspace_config(args.target)
-
-            source_tenant_id = src_config["tenant_id"]
-            target_tenant_id = target_config["tenant_id"]
-
-            source_credential = AzureCliCredential(tenant_id=source_tenant_id)
-            target_credential = AzureCliCredential(tenant_id=target_tenant_id)
+            source_credential = AzureCliCredential(tenant_id=src_config["tenant_id"])
 
             source_account_name = getattr(source_datastore, "account_name", None)
-            target_account_name = getattr(target_datastore, "account_name", None)
             source_container_name = getattr(source_datastore, "container_name", None)
-            target_container_name = getattr(target_datastore, "container_name", None)
-            if not source_container_name or not target_container_name:
+            if not source_account_name or not source_container_name:
                 raise RuntimeError(
-                    "Datastore container name missing for source or target workspace."
+                    "Datastore account or container name missing for source workspace."
                 )
             src_blob_service = BlobServiceClient(
                 f"https://{source_account_name}.blob.core.windows.net",
                 credential=source_credential,
-            )
-            tgt_blob_service = BlobServiceClient(
-                f"https://{target_account_name}.blob.core.windows.net",
-                credential=target_credential,
             )
 
             # Resolve source container (v1 workspaces may use "azureml" instead)
@@ -529,31 +508,14 @@ def main(args):
                     )
                     print(f"Resolved source container: {source_container_name}")
 
-            # Build SAS: source read, target write
+            # Read-only source SAS. The replay step downloads into its own ./outputs,
+            # so no SAS for the target storage is needed.
             source_sas = build_container_sas(
-                src_blob_service, source_container_name, hours=6
+                src_blob_service, source_container_name, hours=args.sas_hours
             )
-            # Write-enabled target SAS
-            start = datetime.now(timezone.utc) - timedelta(minutes=5)
-            expiry = datetime.now(timezone.utc) + timedelta(hours=6)
-            try:
-                udk_tgt = tgt_blob_service.get_user_delegation_key(start, expiry)
-                perms_tgt = ContainerSasPermissions(
-                    read=True, list=True, create=True, write=True, add=True
-                )
-                target_sas = generate_container_sas(
-                    account_name=str(tgt_blob_service.account_name),
-                    container_name=target_container_name,
-                    user_delegation_key=udk_tgt,
-                    permission=perms_tgt,
-                    expiry=expiry,
-                )
-            except Exception as e:  # noqa: BLE001
-                raise RuntimeError(
-                    "Failed generating write-enabled SAS for target storage account. "
-                    "Ensure the signed-in identity has Storage Blob Data Contributor and Data Delegator roles."
-                ) from e
-            print("Prepared storage context for in-run server-side artifact copy.")
+            print(
+                f"Prepared read-only source SAS (valid {args.sas_hours} h) for in-run artifact download."
+            )
         except Exception as e:  # noqa: BLE001
             logger.error("Could not prepare storage context for manifests: %s", e)
             print(f"ERROR: Could not prepare storage context for manifests: {e}")
@@ -628,11 +590,6 @@ def main(args):
                 "container": source_container_name,
                 "prefix": f"ExperimentRun/dcid.{meta.name}",
                 "sas": source_sas,
-            },
-            "target": {
-                "account": target_account_name,
-                "container": target_container_name,
-                "sas": target_sas,
             },
             "relative_paths": selected_paths,
             "normalized_relative_paths": normalized_selected_paths,
@@ -1009,6 +966,16 @@ if __name__ == "__main__":
         help=(
             "Override the source blob container name instead of auto-detecting. "
             "Use when the workspace has a non-standard container (e.g., v1 'azureml')."
+        ),
+    )
+
+    parser.add_argument(
+        "--sas-hours",
+        type=int,
+        default=2,
+        help=(
+            "Validity of the read-only source SAS embedded in the artifact manifests (default: 2)."
+            " It must outlast the queue time of the replay jobs."
         ),
     )
 
