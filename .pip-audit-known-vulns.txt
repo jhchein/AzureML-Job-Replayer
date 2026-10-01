@@ -1,0 +1,12 @@
+# Known vulnerabilities that pip-audit should ignore. One ID per line.
+# Review periodically and remove entries once a fixed upstream version is locked.
+#
+# Last triaged: 2026-10-01 (after `uv lock --upgrade`)
+
+# cryptography 49.0.0 - PKCS#7 EnvelopedData decryption Bleichenbacher oracle (fix: 50.0.0).
+# Not exploitable: we never decrypt PKCS#7 data. Revisit once azure-identity/msal allow 50.x.
+PYSEC-2026-3552
+
+# mlflow 3.15.0 - AI Gateway SSRF via unvalidated api_base. No fix released yet.
+# Not exploitable: we use the mlflow client only and never run the MLflow server/AI Gateway.
+PYSEC-2026-3865

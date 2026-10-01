@@ -1,0 +1,38 @@
+name: Upgrade lockfile
+
+# Refreshes uv.lock without needing PyPI access on the developer machine.
+# Run manually (Actions tab / `gh workflow run`) on a non-default branch;
+# the updated lock is committed back to that branch.
+on:
+  workflow_dispatch:
+  push:
+    branches: [chore/lock-upgrade]
+
+permissions:
+  contents: write
+
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    if: github.ref_name != github.event.repository.default_branch
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Upgrade lockfile
+        run: uv lock --upgrade
+
+      - name: Summarize changes
+        run: git diff --stat uv.lock | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit and push
+        run: |
+          if git diff --quiet uv.lock; then
+            echo "uv.lock already up to date"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore: uv lock --upgrade"
+          git push
