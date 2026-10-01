@@ -7,3 +7,6 @@ dependencies:
     - mlflow==3.1.4
     - azureml-mlflow==1.62.0.post6
     - azure-storage-blob==12.30.3
+    # Only used by --artifact-access rbac (AzureMLOnBehalfOfCredential)
+    - azure-ai-ml==1.35.1
+    - azure-identity==1.25.3

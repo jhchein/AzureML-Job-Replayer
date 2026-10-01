@@ -157,6 +157,8 @@ If you skip enumeration (`--no-artifacts`), artifact replay is naturally absent.
 | `--limit N`         | Cap number of replay units                      |
 | `--dry-run`         | Build only (no submission)                      |
 | `--copy-artifacts`  | Enable artifact & log download into `./outputs` |
+| `--artifact-access` | `sas` (default, per-blob SAS, cross-tenant) or `rbac` (no tokens) |
+| `--sas-hours N`   | Lifetime of the per-blob SAS tokens (default 2)  |
 | `--debug-hierarchy` | Print multi-level pipeline tree (dry or submit) |
 
 ---

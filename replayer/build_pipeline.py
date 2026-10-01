@@ -21,9 +21,9 @@ from azure.ai.ml.entities import (
 from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
 from azure.identity import AzureCliCredential
 from azure.storage.blob import (
+    BlobSasPermissions,
     BlobServiceClient,
-    ContainerSasPermissions,
-    generate_container_sas,
+    generate_blob_sas,
 )
 
 from extractor.extract_jobs import JobMetadata
@@ -411,28 +411,51 @@ def build_dummy_standalone_job(
     return job
 
 
-def build_container_sas(service: BlobServiceClient, container: str, hours: int = 4):
+def _get_delegation_key(service: BlobServiceClient, hours: int):
+    """Return (user delegation key, expiry) valid for ``hours`` hours."""
     start = datetime.now(timezone.utc) - timedelta(minutes=5)
     expiry = datetime.now(timezone.utc) + timedelta(hours=hours)
     try:
-        udk = service.get_user_delegation_key(start, expiry)
+        return service.get_user_delegation_key(start, expiry), expiry
     except Exception as e:  # noqa: BLE001
         raise RuntimeError(
             "Failed to get user delegation key"
             " (need Storage Blob Data Delegator OR Data Owner on the storage account)."
             f" Underlying error: {e}"
         ) from e
-    # For write scenarios we may request additional permissions later; default read/list
-    perms = ContainerSasPermissions(read=True, list=True)
-    sas = generate_container_sas(
-        account_name=str(service.account_name),
-        container_name=container,
-        user_delegation_key=udk,
-        permission=perms,
-        expiry=expiry,
-    )
-    return sas
 
+
+def _collect_blob_sas_entries(
+    service: BlobServiceClient,
+    container: str,
+    job_prefix: str,
+    folders: List[str],
+    user_delegation_key: Any,
+    expiry: datetime,
+) -> List[Dict[str, Any]]:
+    """List a job's artifact blobs and create one read-only SAS per blob.
+
+    Flat-namespace storage cannot scope a SAS to a prefix, so a container SAS
+    would expose every job. Per-blob tokens limit access to this job's files.
+    """
+    container_client = service.get_container_client(container)
+    account_name = str(service.account_name)
+    entries: List[Dict[str, Any]] = []
+    for folder in folders:
+        folder_clean = folder.strip("/\\")
+        for blob in container_client.list_blobs(
+            name_starts_with=f"{job_prefix}/{folder_clean}/"
+        ):
+            sas = generate_blob_sas(
+                account_name=account_name,
+                container_name=container,
+                blob_name=blob.name,
+                user_delegation_key=user_delegation_key,
+                permission=BlobSasPermissions(read=True),
+                expiry=expiry,
+            )
+            entries.append({"name": blob.name, "size": blob.size, "sas": sas})
+    return entries
 
 # --- Main execution logic ---
 def main(args):
@@ -475,7 +498,10 @@ def main(args):
     manifests_by_job: Dict[str, str] = {}
     source_account_name = None
     source_container_name = None
-    source_sas = None
+    source_udk = None
+    source_expiry = None
+    src_blob_service = None
+    use_sas = args.artifact_access == "sas"
     if copy_artifacts and args.source:
         try:
             source_client = get_ml_client(args.source)
@@ -508,14 +534,20 @@ def main(args):
                     )
                     print(f"Resolved source container: {source_container_name}")
 
-            # Read-only source SAS. The replay step downloads into its own ./outputs,
-            # so no SAS for the target storage is needed.
-            source_sas = build_container_sas(
-                src_blob_service, source_container_name, hours=args.sas_hours
-            )
-            print(
-                f"Prepared read-only source SAS (valid {args.sas_hours} h) for in-run artifact download."
-            )
+            if use_sas:
+                # Per-blob read-only SAS (cross-tenant safe). No target SAS is needed:
+                # the replay step downloads into its own ./outputs.
+                source_udk, source_expiry = _get_delegation_key(
+                    src_blob_service, args.sas_hours
+                )
+                print(
+                    f"Prepared user delegation key (SAS valid {args.sas_hours} h)."
+                )
+            else:
+                print(
+                    "Artifact access mode 'rbac': no SAS tokens are created;"
+                    " the replay identity needs Storage Blob Data Reader on the source storage."
+                )
         except Exception as e:  # noqa: BLE001
             logger.error("Could not prepare storage context for manifests: %s", e)
             print(f"ERROR: Could not prepare storage context for manifests: {e}")
@@ -538,12 +570,12 @@ def main(args):
                 " Ensure SAS generation succeeded earlier."
             )
             sys.exit(1)
-        if not source_sas:
+        if use_sas and not source_udk:
             logger.error(
-                "Artifact copy requested but source SAS token was not generated. Verify storage permissions."
+                "Artifact copy requested but no user delegation key was obtained. Verify storage permissions."
             )
             print(
-                "ERROR: Artifact copy requested but source SAS token was not generated. Verify storage permissions."
+                "ERROR: Artifact copy requested but no user delegation key was obtained. Verify storage permissions."
             )
             sys.exit(1)
         if not rel_paths:
@@ -578,18 +610,30 @@ def main(args):
                 normalized_selected_paths.append(f"outputs/original_logs/{p}")
             else:
                 normalized_selected_paths.append(p)
+        job_prefix = f"ExperimentRun/dcid.{meta.name}"
+        blobs = None
+        if use_sas:
+            blobs = _collect_blob_sas_entries(
+                src_blob_service,
+                source_container_name,
+                job_prefix,
+                selected_paths,
+                source_udk,
+                source_expiry,
+            )
+            print(f"Job {meta.name}: created SAS for {len(blobs)} artifact blob(s).")
         fd, manifest_path = tempfile.mkstemp(
             suffix=f"_{meta.name}_artifact_manifest.json"
         )
         manifest = {
-            "schema_version": 1,
+            "schema_version": 2,
             "disabled": False,
+            "access": args.artifact_access,
             "original_run_id": meta.name,
             "source": {
                 "account": source_account_name,
                 "container": source_container_name,
-                "prefix": f"ExperimentRun/dcid.{meta.name}",
-                "sas": source_sas,
+                "prefix": job_prefix,
             },
             "relative_paths": selected_paths,
             "normalized_relative_paths": normalized_selected_paths,
@@ -598,6 +642,8 @@ def main(args):
                 " Logs remapped to outputs/original_logs/"
             ),
         }
+        if blobs is not None:
+            manifest["blobs"] = blobs
         with os.fdopen(fd, "w", encoding="utf-8") as mf:
             json.dump(manifest, mf)
         manifests_by_job[meta.name] = manifest_path
@@ -970,11 +1016,21 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--artifact-access",
+        choices=["sas", "rbac"],
+        default="sas",
+        help=(
+            "How the replay step reads source artifacts. 'sas' (default): per-blob read-only SAS in the"
+            " manifest, works cross-tenant. 'rbac': no tokens; the job's user identity needs"
+            " Storage Blob Data Reader on the source storage (same-tenant setups)."
+        ),
+    )
+    parser.add_argument(
         "--sas-hours",
         type=int,
         default=2,
         help=(
-            "Validity of the read-only source SAS embedded in the artifact manifests (default: 2)."
+            "Validity of the per-blob read-only SAS tokens (--artifact-access sas, default: 2 hours)."
             " It must outlast the queue time of the replay jobs."
         ),
     )

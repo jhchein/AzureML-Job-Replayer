@@ -9,6 +9,122 @@ from typing import Any, Dict, List, Optional, Tuple
 import mlflow
 from azure.storage.blob import BlobClient, ContainerClient
 
+_LOG_FOLDERS = ("logs/", "system_logs/", "user_logs/")
+
+
+def _local_dest(rel_path: str) -> str:
+    """Map a job-relative blob path to its path below ./outputs.
+
+    outputs/<x> -> <x>; log folders -> original_logs/<folder>/...; others unchanged.
+    """
+    if rel_path.startswith("outputs/"):
+        return rel_path[len("outputs/") :]
+    if rel_path.startswith(_LOG_FOLDERS):
+        return f"original_logs/{rel_path}"
+    return rel_path
+
+
+def _rbac_credential():
+    """Credential for access mode 'rbac': the job's user identity if available."""
+    try:
+        from azure.ai.ml.identity import AzureMLOnBehalfOfCredential
+
+        return AzureMLOnBehalfOfCredential()
+    except Exception:  # noqa: BLE001
+        from azure.identity import DefaultAzureCredential
+
+        return DefaultAzureCredential()
+
+
+def _manifest_blob_clients(manifest: Dict[str, Any]) -> List[Tuple[str, BlobClient]]:
+    """Return (blob name, client) for every artifact blob listed in the manifest."""
+    src = manifest.get("source", {})
+    account, container = src.get("account"), src.get("container")
+    prefix = (src.get("prefix") or "").strip("/")
+    if not (account and container and prefix):
+        raise RuntimeError("Artifact manifest missing source account/container/prefix.")
+    account_url = f"https://{account}.blob.core.windows.net"
+
+    if manifest.get("access", "sas") == "sas":
+        # Per-blob read-only SAS tokens prepared by the replayer at build time.
+        blobs = manifest.get("blobs")
+        if blobs is None:
+            raise RuntimeError("Artifact manifest has access=sas but no 'blobs' list.")
+        return [
+            (b["name"], BlobClient(account_url, container, b["name"], credential=b["sas"]))
+            for b in blobs
+        ]
+
+    container_client = ContainerClient(
+        account_url, container, credential=_rbac_credential()
+    )
+    result: List[Tuple[str, BlobClient]] = []
+    for folder in manifest.get("relative_paths", []):
+        folder_clean = folder.strip("/\\")
+        for blob in container_client.list_blobs(
+            name_starts_with=f"{prefix}/{folder_clean}/"
+        ):
+            result.append((blob.name, container_client.get_blob_client(blob.name)))
+    return result
+
+
+def _download_artifacts(manifest: Dict[str, Any]) -> None:
+    """Download the manifest's blobs into ./outputs and write a summary file."""
+    prefix = (manifest.get("source", {}).get("prefix") or "").strip("/")
+    work_items = _manifest_blob_clients(manifest)
+    print(f"Planned downloads: {len(work_items)} blob file(s)")
+
+    base_outputs = Path("outputs")
+    base_outputs.mkdir(exist_ok=True)
+    base_resolved = base_outputs.resolve()
+    start_time = time.time()
+    success = 0
+    failures: List[Dict[str, Any]] = []
+    total_bytes = 0
+    for blob_name, blob_client in work_items:
+        rel_path = blob_name[len(prefix) + 1 :] if blob_name.startswith(f"{prefix}/") else blob_name
+        local_path = base_outputs / _local_dest(rel_path)
+        try:
+            # Reject blob names that would escape ./outputs (e.g. via "..")
+            if base_resolved not in local_path.resolve().parents:
+                raise ValueError(f"Blob path escapes outputs directory: {rel_path}")
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(local_path, "wb") as lf:
+                for chunk in blob_client.download_blob().chunks():
+                    lf.write(chunk)
+            total_bytes += os.path.getsize(local_path)
+            success += 1
+            if success % 50 == 0:
+                print(f"Downloaded {success}/{len(work_items)} files (bytes={total_bytes})")
+        except Exception as e:  # noqa: BLE001
+            failures.append({"source": rel_path, "dest": str(local_path), "error": str(e)})
+            if local_path.exists():
+                local_path.unlink()
+
+    elapsed = time.time() - start_time
+    print(
+        f"Artifact download summary: total={len(work_items)}"
+        f" success={success} failed={len(failures)}"
+        f" bytes={total_bytes} time_sec={elapsed:.2f}"
+    )
+    summary_path = base_outputs / "_replay_download_summary.json"
+    with open(summary_path, "w", encoding="utf-8") as sf:
+        json.dump(
+            {
+                "total": len(work_items),
+                "success": success,
+                "failed": len(failures),
+                "failures": failures[:25],
+                "bytes": total_bytes,
+                "elapsed_sec": elapsed,
+            },
+            sf,
+            indent=2,
+        )
+    if failures:
+        print("First failure:", failures[0])
+        raise RuntimeError("One or more artifact downloads failed; aborting replay step.")
+
 
 def log_metrics(
     job_id: str,
@@ -69,191 +185,9 @@ def log_metrics(
                 perform_server_copy = False
         if manifest and not manifest.get("disabled") and perform_server_copy:
             print("Starting artifact download into local ./outputs ...")
-            src_info = manifest.get("source", {})
-            src_acct = src_info.get("account")
-            src_container = src_info.get("container")
-            src_prefix = (src_info.get("prefix") or "").strip("/")
-            src_sas = src_info.get("sas")
-            if not (src_acct and src_container and src_sas):
-                raise RuntimeError(
-                    "Artifact manifest missing account/container/sas values; cannot perform server-side copy."
-                )
-            else:
-                src_list: List[str] = manifest.get("relative_paths", [])
-
-                # src_list now contains folder prefixes like ["outputs/", "system_logs/", etc.]
-                # We need to list all blobs under each prefix, then download them
-                print(
-                    f"Manifest contains {len(src_list)} folder prefix(es) to enumerate and download."
-                )
-
-                # Build container client to list blobs
-                container_url = f"https://{src_acct}.blob.core.windows.net/{src_container}?{src_sas}"
-                print(f"Container URL (with SAS): {container_url[:80]}...?<SAS_TOKEN>")
-                container_client = ContainerClient.from_container_url(container_url)
-
-                print(f"Source blob prefix for job: {src_prefix}")
-
-                # Enumerate all blobs under each folder prefix
-                work_items: List[Tuple[str, str]] = []
-                for folder_prefix in src_list:
-                    folder_clean = folder_prefix.lstrip("/\\").rstrip(
-                        "/\\"
-                    )  # Remove trailing slashes too
-                    full_prefix = f"{src_prefix}/{folder_clean}".strip("/")
-                    print(f"Listing blobs under prefix: '{full_prefix}' ...")
-                    print(f"  Folder prefix from manifest: '{folder_prefix}'")
-                    print(f"  Cleaned folder: '{folder_clean}'")
-                    print(f"  Full blob prefix: '{full_prefix}'")
-
-                    try:
-                        blob_count = 0
-                        for blob in container_client.list_blobs(
-                            name_starts_with=full_prefix
-                        ):
-                            # blob.name is the full path within the container
-                            # Extract the relative path from src_prefix onwards
-                            if blob.name.startswith(f"{src_prefix}/"):
-                                rel_path = blob.name[len(src_prefix) + 1 :]
-                            else:
-                                rel_path = blob.name
-
-                            # Debug: print first few blobs
-                            if blob_count < 3:
-                                print(
-                                    f"    DEBUG: blob.name='{blob.name}' -> rel_path='{rel_path}'"
-                                )
-
-                            # Compute normalized destination path
-                            if rel_path.startswith("outputs/"):
-                                # Strip outputs/ prefix for destination
-                                norm_dest = rel_path[len("outputs/") :]
-                            elif (
-                                rel_path.startswith("logs/")
-                                or rel_path.startswith("system_logs/")
-                                or rel_path.startswith("user_logs/")
-                            ):
-                                # Map logs to outputs/original_logs/
-                                norm_dest = f"outputs/original_logs/{rel_path}"
-                            else:
-                                norm_dest = rel_path
-
-                            work_items.append((rel_path, norm_dest))
-                            blob_count += 1
-
-                        print(f"  ✓ Found {blob_count} blob(s) under '{folder_clean}'")
-                    except Exception as e:  # noqa: BLE001
-                        raise RuntimeError(
-                            f"Failed to enumerate blobs for prefix {full_prefix}: {e}"
-                        ) from e
-
-                if not work_items:
-                    print("No blob files found under the specified folder prefixes.")
-                else:
-                    print(f"Planned downloads: {len(work_items)} blob file(s)")
-                    for s_rel, norm_dest in work_items[:3]:
-                        print(f"  SAMPLE SRC='{s_rel}' -> DST='{norm_dest}'")
-
-                base_outputs = Path("outputs")
-                base_outputs.mkdir(exist_ok=True)
-                start_time = time.time()
-                success = 0
-                failures: List[Dict[str, Any]] = []
-                total_bytes = 0
-                for src_rel, norm_dest in work_items:
-                    rel_clean = src_rel.lstrip("/\\")
-                    dest_rel = norm_dest.lstrip("/\\")
-
-                    # Basic path sanitization
-                    dest_rel = dest_rel.replace("..", "__")
-
-                    # Determine final local path:
-                    # - Files from outputs/ (dest without outputs/ prefix) go to outputs/ root
-                    # - Files from logs (dest with outputs/original_logs/ prefix) go there
-                    if dest_rel.startswith("outputs/"):
-                        # Already has outputs/ prefix (logs remapped to outputs/original_logs/)
-                        local_path = Path(dest_rel)
-                    else:
-                        # Stripped outputs/ prefix - write to outputs/ directory
-                        local_path = base_outputs / dest_rel
-                    local_path.parent.mkdir(parents=True, exist_ok=True)
-
-                    # Build source blob URL
-                    source_url = f"https://{src_acct}.blob.core.windows.net/{src_container}/{src_prefix}/{rel_clean}".rstrip(
-                        "/"
-                    )
-                    # Avoid double slashes except protocol
-                    source_url = source_url.replace("//", "/").replace(":/", "://")
-                    if "?" in source_url:
-                        # Already contains query - unlikely here
-                        full_url = f"{source_url}&{src_sas}"
-                    else:
-                        full_url = f"{source_url}?{src_sas}"
-                    try:
-                        blob_client = BlobClient.from_blob_url(full_url)
-                        downloader = blob_client.download_blob()
-                        with open(local_path, "wb") as lf:
-                            for chunk in downloader.chunks():
-                                lf.write(chunk)
-                        size = os.path.getsize(local_path)
-                        total_bytes += size
-                        success += 1
-                        if success % 50 == 0:
-                            print(
-                                f"Downloaded {success}/{len(work_items)} files (bytes={total_bytes})"
-                            )
-                    except Exception as e:  # noqa: BLE001
-                        failures.append(
-                            {
-                                "source": rel_clean,
-                                "dest": str(local_path),
-                                "error": str(e),
-                            }
-                        )
-                        # Remove partial file if exists
-                        try:
-                            if local_path.exists():
-                                local_path.unlink()
-                        except Exception:
-                            pass
-
-                elapsed = time.time() - start_time
-                print(
-                    f"Artifact download summary: total={len(work_items)}"
-                    f" success={success} failed={len(failures)}"
-                    f" bytes={total_bytes} time_sec={elapsed:.2f}"
-                )
-                if failures:
-                    print("First failure:", failures[0])
-                    if len(failures) < 6:
-                        print("All failures:", failures)
-                    raise RuntimeError(
-                        "One or more artifact downloads failed; aborting replay step."
-                    )
-                # Write summary file for visibility
-                try:
-                    summary_path = base_outputs / "_replay_download_summary.json"
-                    with open(summary_path, "w", encoding="utf-8") as sf:
-                        json.dump(
-                            {
-                                "total": len(work_items),
-                                "success": success,
-                                "failed": len(failures),
-                                "failures": failures[:25],
-                                "bytes": total_bytes,
-                                "elapsed_sec": elapsed,
-                            },
-                            sf,
-                            indent=2,
-                        )
-                    print(
-                        f"Wrote download summary to {summary_path} (will appear in Outputs + logs)."
-                    )
-                except Exception as se:  # noqa: BLE001
-                    print(f"Failed to write summary file: {se}")
-        else:
-            if manifest and manifest.get("disabled"):
-                print("Artifact manifest disabled; skipping downloads.")
+            _download_artifacts(manifest)
+        elif manifest and manifest.get("disabled"):
+            print("Artifact manifest disabled; skipping downloads.")
     else:
         print("No artifact manifest path provided; skipping server-side copy.")
 
