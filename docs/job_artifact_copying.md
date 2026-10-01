@@ -67,11 +67,12 @@ ExperimentRun/dcid.{replay_job_name}/
 ## Key Points
 
 - **Recursive copying**: All files and subdirectories under each folder are copied
-- **Dynamic blob enumeration**: At replay runtime, the component lists all blobs under each folder prefix using Azure Storage APIs
-- **No individual file enumeration during extraction**: Extraction phase uses only 4 static folder prefixes - actual file listing happens during replay
+- **Blob enumeration at build time**: `build_pipeline` lists each job's blobs under the folder prefixes and puts them in the manifest (`--artifact-access sas`, default). In `rbac` mode the replay step lists them itself
+- **No individual file enumeration during extraction**: Extraction phase uses only 4 static folder prefixes
 - **Log consolidation**: All log folders are copied into `outputs/original_logs/` to keep them with the replay job's outputs
 - **Performance during extraction**: Eliminates O(files) or O(directories) REST calls during extraction - uses only 4 static folder prefixes per job
-- **Performance during replay**: One-time blob listing per folder prefix at replay time, then parallel downloads
+- **Per-blob read-only SAS**: Flat-namespace storage cannot scope a SAS to a prefix, so a container SAS would expose every job. Each blob gets its own read-only user-delegation SAS (default 2 h, `--sas-hours`). Works cross-tenant. The manifest is uploaded as job input and holds these tokens, so treat it as sensitive
+- **RBAC mode** (`--artifact-access rbac`): no tokens at all. The replay job's user identity needs *Storage Blob Data Reader* on the source storage. Only works if that identity is allowed on the source storage (usually same-tenant)
 
 ## Manifest Structure
 
@@ -79,15 +80,18 @@ Each job gets an artifact manifest file with:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "disabled": false,
+  "access": "sas",
   "original_run_id": "job_name",
   "source": {
     "account": "source_storage_account",
     "container": "azureml",
-    "prefix": "ExperimentRun/dcid.job_name",
-    "sas": "source_read_sas_token"
+    "prefix": "ExperimentRun/dcid.job_name"
   },
+  "blobs": [
+    { "name": "ExperimentRun/dcid.job_name/outputs/model.pkl", "size": 1234, "sas": "per_blob_read_sas_token" }
+  ],
   "relative_paths": ["outputs/", "system_logs/", "logs/", "user_logs/"],
   "normalized_relative_paths": [
     "outputs/",

@@ -1,7 +1,7 @@
 """Tests for pure functions in replayer.build_pipeline."""
 
 import json
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from azure.core.exceptions import ResourceNotFoundError
 
@@ -450,3 +450,40 @@ class TestResolveSourceContainer:
 
         with pytest.raises(RuntimeError, match="Could not find"):
             _resolve_source_container(svc, "azureml", ["job1"])
+
+# ── _collect_blob_sas_entries ───────────────────────────────────────
+
+
+class TestCollectBlobSasEntries:
+    def test_creates_one_read_sas_per_blob_with_folder_prefix(self):
+        from datetime import datetime, timezone
+
+        from replayer.build_pipeline import _collect_blob_sas_entries
+
+        blob = MagicMock()
+        blob.name = "ExperimentRun/dcid.j/outputs/a.txt"
+        blob.size = 3
+        container_client = MagicMock()
+        container_client.list_blobs.return_value = [blob]
+        service = MagicMock()
+        service.account_name = "acct"
+        service.get_container_client.return_value = container_client
+
+        with patch("replayer.build_pipeline.generate_blob_sas", return_value="sig=abc") as gen:
+            entries = _collect_blob_sas_entries(
+                service,
+                "c",
+                "ExperimentRun/dcid.j",
+                ["outputs/"],
+                "udk",
+                datetime.now(timezone.utc),
+            )
+
+        container_client.list_blobs.assert_called_once_with(
+            name_starts_with="ExperimentRun/dcid.j/outputs/"
+        )
+        assert entries == [{"name": blob.name, "size": 3, "sas": "sig=abc"}]
+        kwargs = gen.call_args.kwargs
+        assert kwargs["blob_name"] == blob.name
+        assert kwargs["permission"].read is True
+        assert not kwargs["permission"].write

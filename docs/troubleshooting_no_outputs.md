@@ -21,16 +21,13 @@ Look for these specific log messages in `user_logs/std_log.txt`:
 
 ```
 Starting artifact download into local ./outputs ...
-Manifest contains 4 folder prefix(es) to enumerate and download.
-Container URL (with SAS): https://...
-Source blob prefix for job: ExperimentRun/dcid.{job_name}
-Listing blobs under prefix: 'ExperimentRun/dcid.{job_name}/outputs' ...
-  ✓ Found X blob(s) under 'outputs'
+Planned downloads: X blob file(s)
+Artifact download summary: total=X success=X failed=0 ...
 ```
 
 ### 3. Common Issues and Fixes
 
-#### Issue: "Found 0 blob(s)" for all folders
+#### Issue: "Planned downloads: 0 blob file(s)"
 
 **Cause**: Source blobs don't exist or path is wrong  
 **Fix**:
@@ -40,7 +37,7 @@ Listing blobs under prefix: 'ExperimentRun/dcid.{job_name}/outputs' ...
 
 #### Issue: "Manifest missing required source fields"
 
-**Cause**: SAS token generation failed or source config missing  
+**Cause**: Manifest was built without source details (source config missing)  
 **Fix**:
 
 - Ensure you ran build_pipeline with `--source config/source_config.json`
@@ -57,7 +54,8 @@ Listing blobs under prefix: 'ExperimentRun/dcid.{job_name}/outputs' ...
 **Cause**: SAS token expired or invalid permissions  
 **Fix**:
 
-- SAS tokens are valid for 2 hours by default (`--sas-hours`)
+- Per-blob SAS tokens are valid for 2 hours by default (`--sas-hours`)
+- With `--artifact-access rbac` the job identity needs *Storage Blob Data Reader* on the source storage (not possible cross-tenant; use `sas`)
 - Don't wait too long between build_pipeline and job execution
 - Ensure "Storage Blob Data Delegator" role on source storage
 
@@ -103,22 +101,9 @@ Replaying metrics for job: original_job_xyz
 Reading metrics from file: /mnt/azureml/.../metrics_abc.json
 Successfully parsed metrics JSON from file. Found 5 metrics.
 Starting artifact download into local ./outputs ...
-Manifest contains 4 folder prefix(es) to enumerate and download.
-Container URL (with SAS): https://sourceacct.blob.core.windows.net/azureml?<SAS_TOKEN>
-Source blob prefix for job: ExperimentRun/dcid.original_job_xyz
-Listing blobs under prefix: 'ExperimentRun/dcid.original_job_xyz/outputs' ...
-  Folder prefix from manifest: 'outputs/'
-  Cleaned folder: 'outputs'
-  Full blob prefix: 'ExperimentRun/dcid.original_job_xyz/outputs'
-    DEBUG: blob.name='ExperimentRun/dcid.original_job_xyz/outputs/model.pkl' -> rel_path='outputs/model.pkl'
-  ✓ Found 12 blob(s) under 'outputs'
-Listing blobs under prefix: 'ExperimentRun/dcid.original_job_xyz/system_logs' ...
-  ✓ Found 3 blob(s) under 'system_logs'
 Planned downloads: 15 blob file(s)
-  SAMPLE SRC='outputs/model.pkl' -> DST='model.pkl'
 Downloaded 15/15 files (bytes=12345678)
 Artifact download summary: total=15 success=15 failed=0 bytes=12345678 time_sec=5.23
-Wrote download summary to outputs/_replay_download_summary.json (will appear in Outputs + logs).
 ```
 
 ### 6. Test with Single Job
