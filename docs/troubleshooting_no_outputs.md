@@ -57,7 +57,7 @@ Listing blobs under prefix: 'ExperimentRun/dcid.{job_name}/outputs' ...
 **Cause**: SAS token expired or invalid permissions  
 **Fix**:
 
-- SAS tokens have 6-hour validity
+- SAS tokens are valid for 2 hours by default (`--sas-hours`)
 - Don't wait too long between build_pipeline and job execution
 - Ensure "Storage Blob Data Delegator" role on source storage
 
@@ -159,6 +159,6 @@ This will show exactly what configuration is being used.
 - [ ] build_pipeline ran with both `--source` and `--copy-artifacts`
 - [ ] Replay job completed successfully (not failed)
 - [ ] Checked `user_logs/std_log.txt` in Azure ML Studio
-- [ ] SAS token hasn't expired (within 6 hours)
+- [ ] SAS token hasn't expired (default 2 hours, see `--sas-hours`)
 - [ ] Azure CLI authenticated with correct subscription
 - [ ] Sufficient RBAC permissions on both source and target storage
