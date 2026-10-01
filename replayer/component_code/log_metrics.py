@@ -9,7 +9,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import mlflow
 from azure.storage.blob import BlobClient, ContainerClient
 
-
 _LOG_FOLDERS = ("logs/", "system_logs/", "user_logs/")
 
 

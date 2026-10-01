@@ -21,8 +21,8 @@ from azure.ai.ml.entities import (
 from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
 from azure.identity import AzureCliCredential
 from azure.storage.blob import (
-    BlobServiceClient,
     BlobSasPermissions,
+    BlobServiceClient,
     generate_blob_sas,
 )
 
